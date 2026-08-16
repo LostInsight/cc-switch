@@ -31,7 +31,11 @@ import {
   OPENCODE_EXTRA_OPTION_DRAFT_PREFIX,
   OPENCODE_HEADER_DRAFT_PREFIX,
 } from "./helpers/opencodeFormUtils";
-import type { ProviderCategory, OpenCodeModel } from "@/types";
+import type {
+  ProviderCategory,
+  ProviderProxyConfig,
+  OpenCodeModel,
+} from "@/types";
 
 /**
  * Model ID input with local state to prevent focus loss.
@@ -185,6 +189,7 @@ interface OpenCodeFormFieldsProps {
   // Extra Options
   extraOptions: Record<string, string>;
   onExtraOptionsChange: (options: Record<string, string>) => void;
+  proxyConfig?: ProviderProxyConfig;
 }
 
 export function OpenCodeFormFields({
@@ -205,6 +210,7 @@ export function OpenCodeFormFields({
   onModelsChange,
   extraOptions,
   onExtraOptionsChange,
+  proxyConfig,
 }: OpenCodeFormFieldsProps) {
   const { t } = useTranslation();
 
@@ -229,7 +235,14 @@ export function OpenCodeFormFields({
       return;
     }
     setIsFetchingModels(true);
-    fetchModelsForConfig(baseUrl, apiKey)
+    fetchModelsForConfig(
+      baseUrl,
+      apiKey,
+      undefined,
+      undefined,
+      undefined,
+      proxyConfig,
+    )
       .then((models) => {
         setFetchedModels(models);
         if (models.length === 0) {
@@ -245,7 +258,7 @@ export function OpenCodeFormFields({
         showFetchModelsError(err, t);
       })
       .finally(() => setIsFetchingModels(false));
-  }, [baseUrl, apiKey, t]);
+  }, [baseUrl, apiKey, proxyConfig, t]);
 
   // Track which models have expanded options panel
   const [expandedModels, setExpandedModels] = useState<Set<string>>(new Set());

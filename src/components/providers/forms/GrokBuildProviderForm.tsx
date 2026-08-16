@@ -51,6 +51,12 @@ import {
 } from "@/utils/grokBuildConfig";
 import { resolveProviderIcon } from "@/utils/providerIcon";
 import { GROKBUILD_OFFICIAL_PROVIDER_ID } from "@/utils/providerCapabilities";
+import {
+  ProviderProxyConfigSection,
+  isValidProviderProxyUrl,
+  normalizeProviderProxyConfig,
+  providerProxyConfigForSave,
+} from "./ProviderAdvancedConfig";
 
 type GrokBuildProviderFormProps = Omit<ProviderFormProps, "appId">;
 
@@ -162,6 +168,9 @@ export function GrokBuildProviderForm({
   const [draftCustomEndpoints, setDraftCustomEndpoints] = useState<string[]>(
     [],
   );
+  const [providerProxyConfig, setProviderProxyConfig] = useState(() =>
+    normalizeProviderProxyConfig(initialData?.meta?.proxyConfig),
+  );
 
   const form = useForm<ProviderFormData>({
     resolver: zodResolver(providerSchema),
@@ -186,6 +195,12 @@ export function GrokBuildProviderForm({
   useEffect(() => {
     onSubmittingChange?.(isSubmitting);
   }, [isSubmitting, onSubmittingChange]);
+
+  useEffect(() => {
+    setProviderProxyConfig(
+      normalizeProviderProxyConfig(initialData?.meta?.proxyConfig),
+    );
+  }, [initialData]);
 
   // Grok Build 预设已不含 cn_official（国产官方直连无法在 Grok CLI 使用）
   const presetCategoryLabels = useMemo(
@@ -312,6 +327,18 @@ export function GrokBuildProviderForm({
 
   const handleSubmit = async (values: ProviderFormData) => {
     const name = values.name.trim();
+    if (
+      providerProxyConfig.mode === "custom" &&
+      !isValidProviderProxyUrl(providerProxyConfig.url)
+    ) {
+      toast.error(
+        t("providerAdvanced.proxyUrlInvalid", {
+          defaultValue:
+            "请输入有效的 http、https、socks5 或 socks5h 代理 URL。",
+        }),
+      );
+      return;
+    }
 
     // 官方条目：config 快照原样透传（新增时为空），不做自定义模型字段校验，
     // 也不重建 config —— 新增走 ensure seed，编辑只允许改名称/图标等元信息。
@@ -325,7 +352,10 @@ export function GrokBuildProviderForm({
         presetId: selectedPresetId ?? undefined,
         presetCategory: "official",
         isPartner: false,
-        meta: initialData?.meta,
+        meta: {
+          ...(initialData?.meta ?? {}),
+          proxyConfig: providerProxyConfigForSave(providerProxyConfig),
+        },
       });
       return;
     }
@@ -405,6 +435,7 @@ export function GrokBuildProviderForm({
       codexChatReasoning,
       customUserAgent: customUserAgent.trim() || undefined,
       localProxyRequestOverrides: requestOverrides.overrides,
+      proxyConfig: providerProxyConfigForSave(providerProxyConfig),
       maxOutputTokens:
         Number.isInteger(parsedMaxOutputTokens) && parsedMaxOutputTokens > 0
           ? parsedMaxOutputTokens
@@ -556,6 +587,7 @@ export function GrokBuildProviderForm({
               promptCacheRouting={promptCacheRouting}
               onPromptCacheRoutingChange={setPromptCacheRouting}
               speedTestEndpoints={speedTestEndpoints}
+              proxyConfig={providerProxyConfigForSave(providerProxyConfig)}
               customUserAgent={customUserAgent}
               onCustomUserAgentChange={setCustomUserAgent}
               localProxyHeadersOverride={headersOverride}
@@ -588,6 +620,11 @@ export function GrokBuildProviderForm({
             </div>
           </>
         )}
+
+        <ProviderProxyConfigSection
+          value={providerProxyConfig}
+          onChange={setProviderProxyConfig}
+        />
 
         <FormField
           control={form.control}

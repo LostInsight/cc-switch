@@ -1283,6 +1283,16 @@
     "empty": "エンドポイントがありません"
   },
   "providerAdvanced": {
+    "proxyConfig": "アウトバウンドプロキシ",
+    "proxyConfigDesc": "通常はグローバルプロキシに従います。このプロバイダー専用のプロキシまたは直接接続も選択できます。",
+    "proxyMode": "プロキシモード",
+    "proxyModeInherit": "グローバルプロキシに従う",
+    "proxyModeCustom": "専用プロキシを使用",
+    "proxyModeDirect": "プロキシなし（直接接続）",
+    "proxyUrl": "プロキシ URL",
+    "proxyUrlHint": "http://127.0.0.1:7890 / socks5h://127.0.0.1:1080",
+    "proxyUrlCredentialHint": "URL にユーザー名とパスワードを含めることができます。",
+    "proxyUrlInvalid": "有効な http、https、socks5、または socks5h プロキシ URL を入力してください。",
     "pricingConfig": "課金設定",
     "useCustomPricing": "個別設定を使用",
     "pricingConfigDesc": "このプロバイダーに個別の課金パラメータを設定します。無効の場合はグローバル設定を使用します。",

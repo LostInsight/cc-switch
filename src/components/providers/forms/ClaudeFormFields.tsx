@@ -53,6 +53,7 @@ import { CustomUserAgentField } from "./CustomUserAgentField";
 import { LocalProxyRequestOverridesField } from "./LocalProxyRequestOverridesField";
 import type {
   ProviderCategory,
+  ProviderProxyConfig,
   ClaudeApiFormat,
   ClaudeApiKeyField,
 } from "@/types";
@@ -139,6 +140,7 @@ interface ClaudeFormFieldsProps {
 
   // Speed Test Endpoints
   speedTestEndpoints: EndpointCandidate[];
+  proxyConfig?: ProviderProxyConfig;
 
   // API Format (for Claude-compatible providers that need request/response conversion)
   apiFormat: ClaudeApiFormat;
@@ -212,6 +214,7 @@ export function ClaudeFormFields({
   subagentModel,
   onModelChange,
   speedTestEndpoints,
+  proxyConfig,
   apiFormat,
   onApiFormatChange,
   apiKeyField,
@@ -301,7 +304,14 @@ export function ClaudeFormFields({
     const modelsUrl = matchedPreset?.modelsUrl;
 
     setIsFetchingModels(true);
-    fetchModelsForConfig(baseUrl, apiKey, isFullUrl, modelsUrl, customUserAgent)
+    fetchModelsForConfig(
+      baseUrl,
+      apiKey,
+      isFullUrl,
+      modelsUrl,
+      customUserAgent,
+      proxyConfig,
+    )
       .then((models) => {
         setFetchedModels(models);
         showModelFetchResult(models.length);
@@ -311,7 +321,15 @@ export function ClaudeFormFields({
         showFetchModelsError(err, t);
       })
       .finally(() => setIsFetchingModels(false));
-  }, [baseUrl, apiKey, isFullUrl, customUserAgent, showModelFetchResult, t]);
+  }, [
+    baseUrl,
+    apiKey,
+    isFullUrl,
+    customUserAgent,
+    proxyConfig,
+    showModelFetchResult,
+    t,
+  ]);
 
   const handleFetchCopilotModels = useCallback(() => {
     if (!isCopilotAuthenticated) {
@@ -793,6 +811,7 @@ export function ClaudeFormFields({
           autoSelect={autoSelect}
           onAutoSelectChange={onAutoSelectChange}
           onCustomEndpointsChange={onCustomEndpointsChange}
+          proxyConfig={proxyConfig}
         />
       )}
 

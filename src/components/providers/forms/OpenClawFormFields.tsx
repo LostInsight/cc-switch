@@ -41,7 +41,11 @@ import {
   type FetchedModel,
 } from "@/lib/api/model-fetch";
 import { openclawApiProtocols } from "@/config/openclawProviderPresets";
-import type { ProviderCategory, OpenClawModel } from "@/types";
+import type {
+  ProviderCategory,
+  ProviderProxyConfig,
+  OpenClawModel,
+} from "@/types";
 
 interface OpenClawFormFieldsProps {
   // Base URL
@@ -68,6 +72,7 @@ interface OpenClawFormFieldsProps {
   // User-Agent
   userAgent: boolean;
   onUserAgentChange: (checked: boolean) => void;
+  proxyConfig?: ProviderProxyConfig;
 }
 
 export function OpenClawFormFields({
@@ -86,6 +91,7 @@ export function OpenClawFormFields({
   onModelsChange,
   userAgent,
   onUserAgentChange,
+  proxyConfig,
 }: OpenClawFormFieldsProps) {
   const { t } = useTranslation();
   const [expandedModels, setExpandedModels] = useState<Record<number, boolean>>(
@@ -140,7 +146,14 @@ export function OpenClawFormFields({
       return;
     }
     setIsFetchingModels(true);
-    fetchModelsForConfig(baseUrl, apiKey)
+    fetchModelsForConfig(
+      baseUrl,
+      apiKey,
+      undefined,
+      undefined,
+      undefined,
+      proxyConfig,
+    )
       .then((models) => {
         setFetchedModels(models);
         if (models.length === 0) {
@@ -156,7 +169,7 @@ export function OpenClawFormFields({
         showFetchModelsError(err, t);
       })
       .finally(() => setIsFetchingModels(false));
-  }, [baseUrl, apiKey, t]);
+  }, [baseUrl, apiKey, proxyConfig, t]);
 
   // Remove a model entry
   const handleRemoveModel = (index: number) => {

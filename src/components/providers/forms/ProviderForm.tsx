@@ -89,6 +89,10 @@ import { OmoFormFields } from "./OmoFormFields";
 import { parseOmoOtherFieldsObject } from "@/types/omo";
 import {
   ProviderAdvancedConfig,
+  ProviderProxyConfigSection,
+  isValidProviderProxyUrl,
+  normalizeProviderProxyConfig,
+  providerProxyConfigForSave,
   type PricingModelSourceOption,
 } from "./ProviderAdvancedConfig";
 import {
@@ -336,6 +340,9 @@ function ProviderFormFull({
       initialData?.meta?.pricingModelSource,
     ),
   }));
+  const [providerProxyConfig, setProviderProxyConfig] = useState(() =>
+    normalizeProviderProxyConfig(initialData?.meta?.proxyConfig),
+  );
 
   const { category } = useProviderCategory({
     appId,
@@ -367,6 +374,9 @@ function ProviderFormFull({
         initialData?.meta?.pricingModelSource,
       ),
     });
+    setProviderProxyConfig(
+      normalizeProviderProxyConfig(initialData?.meta?.proxyConfig),
+    );
     setCodexChatReasoning(initialData?.meta?.codexChatReasoning ?? {});
     setPromptCacheRouting(initialData?.meta?.promptCacheRouting ?? "auto");
     setCustomUserAgent(initialData?.meta?.customUserAgent ?? "");
@@ -1028,6 +1038,19 @@ function ProviderFormFull({
     (appId === "claude" || appId === "codex") && category !== "official";
 
   const handleSubmit = async (values: ProviderFormData) => {
+    if (
+      providerProxyConfig.mode === "custom" &&
+      !isValidProviderProxyUrl(providerProxyConfig.url)
+    ) {
+      toast.error(
+        t("providerAdvanced.proxyUrlInvalid", {
+          defaultValue:
+            "请输入有效的 http、https、socks5 或 socks5h 代理 URL。",
+        }),
+      );
+      return;
+    }
+
     const overridesResult = shouldApplyLocalProxyRequestOverrides
       ? buildLocalProxyRequestOverrides(
           localProxyHeadersOverride,
@@ -1643,6 +1666,7 @@ function ProviderFormFull({
       localProxyRequestOverrides: shouldApplyLocalProxyRequestOverrides
         ? overridesResult.overrides
         : undefined,
+      proxyConfig: providerProxyConfigForSave(providerProxyConfig),
       costMultiplier: pricingConfig.enabled
         ? pricingConfig.costMultiplier
         : undefined,
@@ -2302,6 +2326,7 @@ function ProviderFormFull({
               subagentModel={subagentModel}
               onModelChange={handleModelChange}
               speedTestEndpoints={speedTestEndpoints}
+              proxyConfig={providerProxyConfigForSave(providerProxyConfig)}
               apiFormat={localApiFormat}
               onApiFormatChange={handleApiFormatChange}
               apiKeyField={localApiKeyField}
@@ -2366,6 +2391,7 @@ function ProviderFormFull({
                 catalogModels={codexCatalogModels}
                 onCatalogModelsChange={setCodexCatalogModels}
                 speedTestEndpoints={speedTestEndpoints}
+                proxyConfig={providerProxyConfigForSave(providerProxyConfig)}
                 customUserAgent={customUserAgent}
                 onCustomUserAgentChange={setCustomUserAgent}
                 localProxyHeadersOverride={localProxyHeadersOverride}
@@ -2408,6 +2434,7 @@ function ProviderFormFull({
               model={geminiModel}
               onModelChange={handleGeminiModelChange}
               speedTestEndpoints={speedTestEndpoints}
+              proxyConfig={providerProxyConfigForSave(providerProxyConfig)}
             />
           )}
 
@@ -2429,6 +2456,7 @@ function ProviderFormFull({
               models={opencodeForm.opencodeModels}
               onModelsChange={opencodeForm.handleOpencodeModelsChange}
               extraOptions={opencodeForm.opencodeExtraOptions}
+              proxyConfig={providerProxyConfigForSave(providerProxyConfig)}
               onExtraOptionsChange={
                 opencodeForm.handleOpencodeExtraOptionsChange
               }
@@ -2472,6 +2500,7 @@ function ProviderFormFull({
               models={openclawForm.openclawModels}
               onModelsChange={openclawForm.handleOpenclawModelsChange}
               userAgent={openclawForm.openclawUserAgent}
+              proxyConfig={providerProxyConfigForSave(providerProxyConfig)}
               onUserAgentChange={openclawForm.handleOpenclawUserAgentChange}
             />
           )}
@@ -2493,6 +2522,7 @@ function ProviderFormFull({
               models={hermesForm.hermesModels}
               onModelsChange={hermesForm.handleHermesModelsChange}
               rateLimitDelay={hermesForm.hermesRateLimitDelay}
+              proxyConfig={providerProxyConfigForSave(providerProxyConfig)}
               onRateLimitDelayChange={
                 hermesForm.handleHermesRateLimitDelayChange
               }
@@ -2645,6 +2675,11 @@ function ProviderFormFull({
               {settingsConfigErrorField}
             </>
           )}
+
+          <ProviderProxyConfigSection
+            value={providerProxyConfig}
+            onChange={setProviderProxyConfig}
+          />
 
           {!isAnyOmoCategory &&
             appId !== "opencode" &&

@@ -1283,6 +1283,16 @@
     "empty": "暂无端点"
   },
   "providerAdvanced": {
+    "proxyConfig": "出站代理",
+    "proxyConfigDesc": "默认跟随全局出站代理，也可以为此供应商单独指定代理或直连。",
+    "proxyMode": "代理模式",
+    "proxyModeInherit": "跟随全局代理",
+    "proxyModeCustom": "使用特定代理",
+    "proxyModeDirect": "不使用代理（直连）",
+    "proxyUrl": "代理 URL",
+    "proxyUrlHint": "http://127.0.0.1:7890 / socks5h://127.0.0.1:1080",
+    "proxyUrlCredentialHint": "支持在 URL 中写入用户名和密码。",
+    "proxyUrlInvalid": "请输入有效的 http、https、socks5 或 socks5h 代理 URL。",
     "pricingConfig": "计费配置",
     "useCustomPricing": "使用单独配置",
     "pricingConfigDesc": "为此供应商配置单独的计费参数，不启用时使用全局默认配置。",

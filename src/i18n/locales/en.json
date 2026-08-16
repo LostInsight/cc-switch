@@ -1283,6 +1283,16 @@
     "empty": "No endpoints"
   },
   "providerAdvanced": {
+    "proxyConfig": "Outbound proxy",
+    "proxyConfigDesc": "Follows the global outbound proxy by default. You can use a provider-specific proxy or connect directly.",
+    "proxyMode": "Proxy mode",
+    "proxyModeInherit": "Follow global proxy",
+    "proxyModeCustom": "Use specific proxy",
+    "proxyModeDirect": "No proxy (direct)",
+    "proxyUrl": "Proxy URL",
+    "proxyUrlHint": "http://127.0.0.1:7890 / socks5h://127.0.0.1:1080",
+    "proxyUrlCredentialHint": "The URL may include a username and password.",
+    "proxyUrlInvalid": "Enter a valid http, https, socks5, or socks5h proxy URL.",
     "pricingConfig": "Pricing Config",
     "useCustomPricing": "Use separate config",
     "pricingConfigDesc": "Configure separate pricing parameters for this provider. Uses global defaults when disabled.",

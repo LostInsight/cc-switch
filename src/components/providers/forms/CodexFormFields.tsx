@@ -44,6 +44,7 @@ import type {
   CodexChatReasoning,
   PromptCacheRoutingMode,
   ProviderCategory,
+  ProviderProxyConfig,
 } from "@/types";
 import type { AppId } from "@/lib/api";
 
@@ -108,6 +109,7 @@ interface CodexFormFieldsProps {
 
   // Speed Test Endpoints
   speedTestEndpoints: EndpointCandidate[];
+  proxyConfig?: ProviderProxyConfig;
 
   // Local proxy User-Agent override
   customUserAgent: string;
@@ -204,6 +206,7 @@ export function CodexFormFields({
   catalogModels = [],
   onCatalogModelsChange,
   speedTestEndpoints,
+  proxyConfig,
   customUserAgent,
   onCustomUserAgentChange,
   localProxyHeadersOverride,
@@ -381,6 +384,7 @@ export function CodexFormFields({
       isFullUrl,
       undefined,
       customUserAgent,
+      proxyConfig,
     )
       .then((models) => {
         if (seq !== fetchModelsSeqRef.current) return;
@@ -404,6 +408,7 @@ export function CodexFormFields({
     codexApiKey,
     isFullUrl,
     customUserAgent,
+    proxyConfig,
     isXaiOauthPreset,
     isXaiOauthAuthenticated,
     selectedXaiAccountId,
@@ -1099,6 +1104,7 @@ export function CodexFormFields({
           autoSelect={autoSelect}
           onAutoSelectChange={onAutoSelectChange}
           onCustomEndpointsChange={onCustomEndpointsChange}
+          proxyConfig={proxyConfig}
         />
       )}
     </>

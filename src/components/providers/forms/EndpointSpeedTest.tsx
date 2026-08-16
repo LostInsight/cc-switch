@@ -6,7 +6,11 @@ import { vscodeApi } from "@/lib/api/vscode";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { FullScreenPanel } from "@/components/common/FullScreenPanel";
-import type { CustomEndpoint, EndpointCandidate } from "@/types";
+import type {
+  CustomEndpoint,
+  EndpointCandidate,
+  ProviderProxyConfig,
+} from "@/types";
 
 // 端点测速超时配置（秒）
 const ENDPOINT_TIMEOUT_SECS: Record<AppId, number> = {
@@ -40,6 +44,7 @@ interface EndpointSpeedTestProps {
   // 新建模式：当自定义端点列表变化时回传（仅包含 isCustom 的条目）
   // 编辑模式：不使用此回调，端点直接保存到后端
   onCustomEndpointsChange?: (urls: string[]) => void;
+  proxyConfig?: ProviderProxyConfig;
 }
 
 interface EndpointEntry extends EndpointCandidate {
@@ -95,6 +100,7 @@ const EndpointSpeedTest: React.FC<EndpointSpeedTestProps> = ({
   autoSelect,
   onAutoSelectChange,
   onCustomEndpointsChange,
+  proxyConfig,
 }) => {
   const { t } = useTranslation();
   const [entries, setEntries] = useState<EndpointEntry[]>(() =>
@@ -331,6 +337,7 @@ const EndpointSpeedTest: React.FC<EndpointSpeedTestProps> = ({
     try {
       const results = await vscodeApi.testApiEndpoints(urls, {
         timeoutSecs: ENDPOINT_TIMEOUT_SECS[appId],
+        proxyConfig,
       });
 
       const resultMap = new Map(
@@ -380,7 +387,15 @@ const EndpointSpeedTest: React.FC<EndpointSpeedTestProps> = ({
     } finally {
       setIsTesting(false);
     }
-  }, [entries, autoSelect, appId, normalizedSelected, onChange, t]);
+  }, [
+    entries,
+    autoSelect,
+    appId,
+    normalizedSelected,
+    onChange,
+    proxyConfig,
+    t,
+  ]);
 
   const handleSelect = useCallback(
     (url: string) => {

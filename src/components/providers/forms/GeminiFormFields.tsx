@@ -11,7 +11,7 @@ import {
   showFetchModelsError,
   type FetchedModel,
 } from "@/lib/api/model-fetch";
-import type { ProviderCategory } from "@/types";
+import type { ProviderCategory, ProviderProxyConfig } from "@/types";
 
 interface EndpointCandidate {
   url: string;
@@ -46,6 +46,7 @@ interface GeminiFormFieldsProps {
 
   // Speed Test Endpoints
   speedTestEndpoints: EndpointCandidate[];
+  proxyConfig?: ProviderProxyConfig;
 }
 
 export function GeminiFormFields({
@@ -70,6 +71,7 @@ export function GeminiFormFields({
   model,
   onModelChange,
   speedTestEndpoints,
+  proxyConfig,
 }: GeminiFormFieldsProps) {
   const { t } = useTranslation();
 
@@ -85,7 +87,14 @@ export function GeminiFormFields({
       return;
     }
     setIsFetchingModels(true);
-    fetchModelsForConfig(baseUrl, apiKey)
+    fetchModelsForConfig(
+      baseUrl,
+      apiKey,
+      undefined,
+      undefined,
+      undefined,
+      proxyConfig,
+    )
       .then((models) => {
         setFetchedModels(models);
         if (models.length === 0) {
@@ -101,7 +110,7 @@ export function GeminiFormFields({
         showFetchModelsError(err, t);
       })
       .finally(() => setIsFetchingModels(false));
-  }, [baseUrl, apiKey, t]);
+  }, [baseUrl, apiKey, proxyConfig, t]);
 
   // 检测是否为 Google 官方（使用 OAuth）
   const isGoogleOfficial =
@@ -205,6 +214,7 @@ export function GeminiFormFields({
           autoSelect={autoSelect}
           onAutoSelectChange={onAutoSelectChange}
           onCustomEndpointsChange={onCustomEndpointsChange}
+          proxyConfig={proxyConfig}
         />
       )}
     </>

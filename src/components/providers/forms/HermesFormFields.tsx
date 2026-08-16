@@ -50,7 +50,7 @@ import {
   type HermesApiMode,
   type HermesModel,
 } from "@/config/hermesProviderPresets";
-import type { ProviderCategory } from "@/types";
+import type { ProviderCategory, ProviderProxyConfig } from "@/types";
 
 interface HermesFormFieldsProps {
   baseUrl: string;
@@ -68,6 +68,7 @@ interface HermesFormFieldsProps {
   onModelsChange: (models: HermesModel[]) => void;
   rateLimitDelay: number | undefined;
   onRateLimitDelayChange: (delay: number | undefined) => void;
+  proxyConfig?: ProviderProxyConfig;
 }
 
 type BaseUrlErrorCode = "empty" | "invalid" | "scheme";
@@ -155,6 +156,7 @@ export function HermesFormFields({
   onModelsChange,
   rateLimitDelay,
   onRateLimitDelayChange,
+  proxyConfig,
 }: HermesFormFieldsProps) {
   const { t } = useTranslation();
   const [expandedModels, setExpandedModels] = useState<Record<number, boolean>>(
@@ -231,7 +233,14 @@ export function HermesFormFields({
       return;
     }
     setIsFetchingModels(true);
-    fetchModelsForConfig(baseUrl, apiKey)
+    fetchModelsForConfig(
+      baseUrl,
+      apiKey,
+      undefined,
+      undefined,
+      undefined,
+      proxyConfig,
+    )
       .then((fetched) => {
         setFetchedModels(fetched);
         if (fetched.length === 0) {
@@ -247,7 +256,7 @@ export function HermesFormFields({
         showFetchModelsError(err, t);
       })
       .finally(() => setIsFetchingModels(false));
-  }, [baseUrl, apiKey, t]);
+  }, [baseUrl, apiKey, proxyConfig, t]);
 
   const handleRemoveModel = (index: number) => {
     modelKeysRef.current.splice(index, 1);
