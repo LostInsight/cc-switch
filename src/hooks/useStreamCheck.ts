@@ -6,17 +6,18 @@ import {
   type StreamCheckResult,
 } from "@/lib/api/connectivity-check";
 import type { AppId } from "@/lib/api";
+import { useResetCircuitBreaker } from "@/lib/query/failover";
 
 /**
  * 供应商连通性检查。
  *
- * 只探测 base_url 是否可达（任何 HTTP 响应都算可达），不发真实大模型请求。
- * 刻意 **不** 重置故障转移熔断器——可达 ≠ 配置正确，一个端口通但鉴权废的供应商
- * 不应被误判为"健康"而切回线上。熔断器只由真实转发流量驱动（见 proxy/forwarder.rs）。
+ * 发送真实流式模型请求并等待首个响应片段；鉴权、模型和协议错误都会暴露。
+ * 探测成功后重置故障转移熔断器，使已恢复的渠道重新参与路由。
  */
 export function useStreamCheck(appId: AppId) {
   const { t } = useTranslation();
   const [checkingIds, setCheckingIds] = useState<Set<string>>(new Set());
+  const resetCircuitBreaker = useResetCircuitBreaker();
 
   const checkProvider = useCallback(
     async (
@@ -37,6 +38,7 @@ export function useStreamCheck(appId: AppId) {
             }),
             { closeButton: true },
           );
+          resetCircuitBreaker.mutate({ providerId, appType: appId });
         } else if (result.status === "degraded") {
           toast.warning(
             t("streamCheck.reachableSlow", {
@@ -45,6 +47,7 @@ export function useStreamCheck(appId: AppId) {
               defaultValue: `${providerName} 连通但较慢 (${result.responseTimeMs}ms)`,
             }),
           );
+          resetCircuitBreaker.mutate({ providerId, appType: appId });
         } else {
           // 仅当无法建立连接（DNS / 连接被拒 / TLS / 超时）才会到这里
           toast.error(
@@ -82,7 +85,7 @@ export function useStreamCheck(appId: AppId) {
         });
       }
     },
-    [appId, t],
+    [appId, t, resetCircuitBreaker],
   );
 
   const isChecking = useCallback(

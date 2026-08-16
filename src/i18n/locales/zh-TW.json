@@ -1371,6 +1371,9 @@
     "reasoningGroupTitle": "思考能力",
     "reasoningSectionHint": "預設供應商已自動設定；自訂供應商會按名稱/位址自動推斷。僅當自動識別不準時才需手動覆寫。",
     "advancedSectionHint": "包含上游格式、模型映射、思考能力與自訂 User-Agent。使用 Chat Completions 協定的供應商需開啟路由接管才能使用。",
+    "modelRouteHint": "支援兩種寫法：一般路由 gpt-5.6-terra → gpt-5.6-sol，或思考深度路由 gpt-5.6-terra@max → gpt-5.6-sol@high。兩種路由可以並存；同一模型匹配時深度路由優先，未命中時使用一般路由並保留使用者深度。未知深度標籤會提醒但仍允許儲存。",
+    "modelRouteInvalidEffort": "路由格式無效：{{value}}。請使用 model 或 model@effort，且 effort 不可為空或包含空格。",
+    "modelRouteUnknownEffort": "「{{effort}}」不是目前已知的 Codex 深度標籤；仍會按原樣儲存，並在呼叫時交由上游判斷。",
     "noCommonConfigToApply": "通用設定片段為空或沒有可寫入的內容"
   },
   "geminiConfig": {
@@ -2747,13 +2750,22 @@
     "reachableSlow": "{{providerName}} 連通但較慢 ({{responseTimeMs}}ms)",
     "unreachable": "{{providerName}} 無法連通: {{message}}",
     "unreachableHint": "無法建立連線（DNS / 連線 / TLS / 逾時）。請檢查 base_url 與網路。",
-    "connectivityNote": "連通檢測僅探測供應商位址是否可達，不發送真實模型請求。收到任意回應即視為「可達」——這不代表驗證或模型設定一定正確。",
+    "connectivityNote": "連通檢測會真實發送一次模型請求並等待首個串流回應，可發現驗證、模型和協定設定錯誤。",
     "configSaved": "連通檢測設定已儲存",
     "configSaveFailed": "儲存失敗",
+    "testModels": "測試模型",
+    "claudeModel": "Claude 測試模型",
+    "codexModel": "Codex 測試模型",
+    "geminiModel": "Gemini 測試模型",
     "checkParams": "檢查參數",
     "timeout": "逾時時間（秒）",
     "maxRetries": "最大重試次數",
     "degradedThreshold": "緩慢閾值（毫秒）",
+    "promptTemplates": "連通性測試提示詞",
+    "promptTemplatesHint": "多套提示詞會按連通性測試次數輪詢。支援 {yyyyMMdd} 和 {random[1-100]}，隨機範圍包含兩端。",
+    "promptTemplate": "提示詞 {{index}}",
+    "addPrompt": "新增提示詞",
+    "removePrompt": "刪除提示詞 {{index}}",
     "error": "{{providerName}} 檢查出錯：{{error}}"
   },
   "proxyConfig": {

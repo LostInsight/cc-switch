@@ -79,6 +79,11 @@ import { ClaudeFormFields } from "./ClaudeFormFields";
 import { ClaudeDesktopProviderForm } from "./ClaudeDesktopProviderForm";
 import { GrokBuildProviderForm } from "./GrokBuildProviderForm";
 import { CodexFormFields } from "./CodexFormFields";
+import {
+  CodexModelMappingConfig,
+  findInvalidCodexModelMappingEffort,
+  findNonStandardCodexModelMappingEffort,
+} from "./CodexModelMappingConfig";
 import { GeminiFormFields } from "./GeminiFormFields";
 import { OmoFormFields } from "./OmoFormFields";
 import { parseOmoOtherFieldsObject } from "@/types/omo";
@@ -548,6 +553,9 @@ function ProviderFormFull({
     useState<CodexChatReasoning>(
       () => initialData?.meta?.codexChatReasoning ?? {},
     );
+  const [codexModelMapping, setCodexModelMapping] = useState(
+    () => initialData?.meta?.codexModelMapping,
+  );
   const [promptCacheRouting, setPromptCacheRouting] =
     useState<PromptCacheRoutingMode>(
       () => initialData?.meta?.promptCacheRouting ?? "auto",
@@ -1034,6 +1042,33 @@ function ProviderFormFull({
         }),
       );
       return;
+    }
+
+    if (appId === "codex" && category !== "official") {
+      const invalidMappingEffort =
+        findInvalidCodexModelMappingEffort(codexModelMapping);
+      if (invalidMappingEffort) {
+        toast.error(
+          t("codexConfig.modelRouteInvalidEffort", {
+            defaultValue:
+              "路由格式无效：{{value}}。请使用 model 或 model@effort，且 effort 不能为空或包含空格。",
+            effort: invalidMappingEffort.effort,
+            value: invalidMappingEffort.value,
+          }),
+        );
+        return;
+      }
+      const nonStandardMappingEffort =
+        findNonStandardCodexModelMappingEffort(codexModelMapping);
+      if (nonStandardMappingEffort) {
+        toast.warning(
+          t("codexConfig.modelRouteUnknownEffort", {
+            defaultValue:
+              "“{{effort}}”不是当前已知的 Codex 深度标签；仍会按原样保存，并在调用时交由上游判断。",
+            effort: nonStandardMappingEffort.effort,
+          }),
+        );
+      }
     }
 
     // 软性问题（业务约束，用户可选择仍要保存）
@@ -1587,6 +1622,12 @@ function ProviderFormFull({
         category !== "official" &&
         localCodexApiFormat === "openai_chat"
           ? normalizeCodexChatReasoningForSave(codexChatReasoning)
+          : undefined,
+      codexModelMapping:
+        appId === "codex" &&
+        category !== "official" &&
+        codexModelMapping?.enabled
+          ? codexModelMapping
           : undefined,
       promptCacheRouting:
         appId === "codex" &&
@@ -2277,58 +2318,68 @@ function ProviderFormFull({
           )}
 
           {appId === "codex" && (
-            <CodexFormFields
-              providerId={providerId}
-              isXaiOauthPreset={
-                presetProviderType === "xai_oauth" ||
-                initialData?.meta?.providerType === "xai_oauth"
-              }
-              isXaiOauthAuthenticated={isXaiOauthAuthenticated}
-              selectedXaiAccountId={selectedXaiAccountId}
-              onXaiAccountSelect={setSelectedXaiAccountId}
-              codexApiKey={codexApiKey}
-              onApiKeyChange={handleCodexApiKeyChange}
-              category={category}
-              shouldShowApiKeyLink={shouldShowCodexApiKeyLink}
-              websiteUrl={codexWebsiteUrl}
-              isPartner={isCodexPartner}
-              partnerPromotionKey={codexPartnerPromotionKey}
-              shouldShowSpeedTest={shouldShowSpeedTest}
-              codexBaseUrl={codexBaseUrl}
-              onBaseUrlChange={handleCodexBaseUrlChange}
-              isFullUrl={localIsFullUrl}
-              onFullUrlChange={setLocalIsFullUrl}
-              isEndpointModalOpen={isCodexEndpointModalOpen}
-              onEndpointModalToggle={setIsCodexEndpointModalOpen}
-              onCustomEndpointsChange={
-                isEditMode ? undefined : setDraftCustomEndpoints
-              }
-              autoSelect={endpointAutoSelect}
-              onAutoSelectChange={setEndpointAutoSelect}
-              codexModel={codexModel}
-              onModelChange={handleCodexModelChange}
-              apiFormat={localCodexApiFormat}
-              onApiFormatChange={handleCodexApiFormatChange}
-              anthropicAuthField={localCodexAnthropicAuthField}
-              onAnthropicAuthFieldChange={setLocalCodexAnthropicAuthField}
-              impersonateClaudeCode={localCodexImpersonateClaudeCode}
-              onImpersonateClaudeCodeChange={setLocalCodexImpersonateClaudeCode}
-              maxOutputTokens={localCodexMaxOutputTokens}
-              onMaxOutputTokensChange={setLocalCodexMaxOutputTokens}
-              codexChatReasoning={codexChatReasoning}
-              onCodexChatReasoningChange={setCodexChatReasoning}
-              promptCacheRouting={promptCacheRouting}
-              onPromptCacheRoutingChange={setPromptCacheRouting}
-              catalogModels={codexCatalogModels}
-              onCatalogModelsChange={setCodexCatalogModels}
-              speedTestEndpoints={speedTestEndpoints}
-              customUserAgent={customUserAgent}
-              onCustomUserAgentChange={setCustomUserAgent}
-              localProxyHeadersOverride={localProxyHeadersOverride}
-              onLocalProxyHeadersOverrideChange={setLocalProxyHeadersOverride}
-              localProxyBodyOverride={localProxyBodyOverride}
-              onLocalProxyBodyOverrideChange={setLocalProxyBodyOverride}
-            />
+            <>
+              <CodexFormFields
+                providerId={providerId}
+                isXaiOauthPreset={
+                  presetProviderType === "xai_oauth" ||
+                  initialData?.meta?.providerType === "xai_oauth"
+                }
+                isXaiOauthAuthenticated={isXaiOauthAuthenticated}
+                selectedXaiAccountId={selectedXaiAccountId}
+                onXaiAccountSelect={setSelectedXaiAccountId}
+                codexApiKey={codexApiKey}
+                onApiKeyChange={handleCodexApiKeyChange}
+                category={category}
+                shouldShowApiKeyLink={shouldShowCodexApiKeyLink}
+                websiteUrl={codexWebsiteUrl}
+                isPartner={isCodexPartner}
+                partnerPromotionKey={codexPartnerPromotionKey}
+                shouldShowSpeedTest={shouldShowSpeedTest}
+                codexBaseUrl={codexBaseUrl}
+                onBaseUrlChange={handleCodexBaseUrlChange}
+                isFullUrl={localIsFullUrl}
+                onFullUrlChange={setLocalIsFullUrl}
+                isEndpointModalOpen={isCodexEndpointModalOpen}
+                onEndpointModalToggle={setIsCodexEndpointModalOpen}
+                onCustomEndpointsChange={
+                  isEditMode ? undefined : setDraftCustomEndpoints
+                }
+                autoSelect={endpointAutoSelect}
+                onAutoSelectChange={setEndpointAutoSelect}
+                codexModel={codexModel}
+                onModelChange={handleCodexModelChange}
+                apiFormat={localCodexApiFormat}
+                onApiFormatChange={handleCodexApiFormatChange}
+                anthropicAuthField={localCodexAnthropicAuthField}
+                onAnthropicAuthFieldChange={setLocalCodexAnthropicAuthField}
+                impersonateClaudeCode={localCodexImpersonateClaudeCode}
+                onImpersonateClaudeCodeChange={
+                  setLocalCodexImpersonateClaudeCode
+                }
+                maxOutputTokens={localCodexMaxOutputTokens}
+                onMaxOutputTokensChange={setLocalCodexMaxOutputTokens}
+                codexChatReasoning={codexChatReasoning}
+                onCodexChatReasoningChange={setCodexChatReasoning}
+                promptCacheRouting={promptCacheRouting}
+                onPromptCacheRoutingChange={setPromptCacheRouting}
+                catalogModels={codexCatalogModels}
+                onCatalogModelsChange={setCodexCatalogModels}
+                speedTestEndpoints={speedTestEndpoints}
+                customUserAgent={customUserAgent}
+                onCustomUserAgentChange={setCustomUserAgent}
+                localProxyHeadersOverride={localProxyHeadersOverride}
+                onLocalProxyHeadersOverrideChange={setLocalProxyHeadersOverride}
+                localProxyBodyOverride={localProxyBodyOverride}
+                onLocalProxyBodyOverrideChange={setLocalProxyBodyOverride}
+              />
+              {category !== "official" && (
+                <CodexModelMappingConfig
+                  value={codexModelMapping}
+                  onChange={setCodexModelMapping}
+                />
+              )}
+            </>
           )}
 
           {appId === "gemini" && (

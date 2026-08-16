@@ -350,7 +350,7 @@
       },
       "connectivityCheck": {
         "title": "Connectivity Check Settings",
-        "description": "Configure timeout, retries, and the slow-response threshold for provider reachability checks"
+        "description": "Configure timeout, retries, and the slow-response threshold for real model checks"
       },
       "failover": {
         "title": "Auto Failover",
@@ -1370,6 +1370,9 @@
     "reasoningGroupTitle": "Reasoning Capability",
     "reasoningSectionHint": "Preset providers are configured automatically; custom providers are inferred from name/URL. Override manually only when auto-detection is wrong.",
     "advancedSectionHint": "Includes upstream format, model mapping, reasoning overrides and custom User-Agent. Providers using the Chat Completions protocol require routing takeover to be enabled.",
+    "modelRouteHint": "Two forms are supported: a plain route gpt-5.6-terra → gpt-5.6-sol, or an effort route gpt-5.6-terra@max → gpt-5.6-sol@high. They can coexist; the effort-specific route wins, and a plain fallback preserves the user's effort. Unknown effort labels show a warning but may still be saved.",
+    "modelRouteInvalidEffort": "Invalid route format: {{value}}. Use model or model@effort; effort cannot be empty or contain spaces.",
+    "modelRouteUnknownEffort": "'{{effort}}' is not a currently known Codex effort label. It will still be saved as entered and left for the upstream to accept or reject at request time.",
     "noCommonConfigToApply": "The common config snippet is empty or contains nothing to write"
   },
   "geminiConfig": {
@@ -2746,13 +2749,22 @@
     "reachableSlow": "{{providerName}} reachable but slow ({{responseTimeMs}}ms)",
     "unreachable": "{{providerName}} unreachable: {{message}}",
     "unreachableHint": "Could not establish a connection (DNS / connect / TLS / timeout). Check the base_url and your network.",
-    "connectivityNote": "Connectivity check only probes whether the provider address is reachable; it does not send a real model request. Any response counts as \"reachable\" — which does not guarantee that auth or model settings are correct.",
+    "connectivityNote": "Connectivity check sends a real model request and waits for the first streamed response, so auth, model, and protocol errors are detected.",
     "configSaved": "Connectivity check settings saved",
     "configSaveFailed": "Save failed",
+    "testModels": "Test Models",
+    "claudeModel": "Claude Test Model",
+    "codexModel": "Codex Test Model",
+    "geminiModel": "Gemini Test Model",
     "checkParams": "Check Parameters",
     "timeout": "Timeout (seconds)",
     "maxRetries": "Max Retries",
     "degradedThreshold": "Slow-response threshold (ms)",
+    "promptTemplates": "Connectivity Test Prompts",
+    "promptTemplatesHint": "Multiple prompts rotate between connectivity checks. Supports {yyyyMMdd} and {random[1-100]}; random ranges include both endpoints.",
+    "promptTemplate": "Prompt {{index}}",
+    "addPrompt": "Add Prompt",
+    "removePrompt": "Remove prompt {{index}}",
     "error": "{{providerName}} check error: {{error}}"
   },
   "proxyConfig": {

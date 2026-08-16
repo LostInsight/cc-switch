@@ -392,6 +392,20 @@ pub struct CodexChatReasoningConfig {
     pub output_format: Option<String>,
 }
 
+/// Codex 请求模型到供应商上游模型的独立映射。
+///
+/// 与 model catalog 分离：catalog 负责 Codex 菜单显示，映射负责出站请求，
+/// 因而多个显示模型可以安全地指向同一个上游模型，未配置模型保持原样。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CodexModelMappingConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default, rename = "modelMap")]
+    pub model_map: HashMap<String, String>,
+    #[serde(default, rename = "effortMap")]
+    pub effort_map: HashMap<String, String>,
+}
+
 /// Local proxy request overrides applied after route/protocol transforms.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LocalProxyRequestOverrides {
@@ -530,6 +544,9 @@ pub struct ProviderMeta {
     /// 用于多账号支持，关联到特定的 GitHub 账号
     #[serde(rename = "githubAccountId", skip_serializing_if = "Option::is_none")]
     pub github_account_id: Option<String>,
+    /// Codex 专用模型映射（请求模型 -> 上游模型）。
+    #[serde(rename = "codexModelMapping", skip_serializing_if = "Option::is_none")]
+    pub codex_model_mapping: Option<CodexModelMappingConfig>,
 }
 
 /// 解析 Provider 级自定义 User-Agent 字符串（单一真理来源）。

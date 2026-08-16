@@ -47,7 +47,10 @@ import { BackupListSection } from "@/components/settings/BackupListSection";
 import { WebdavSyncSection } from "@/components/settings/WebdavSyncSection";
 import { AboutSection } from "@/components/settings/AboutSection";
 import { ProxyTabContent } from "@/components/settings/ProxyTabContent";
-import { ConnectivityCheckConfigPanel } from "@/components/usage/ConnectivityCheckConfigPanel";
+import {
+  ConnectivityCheckConfigPanel,
+  type ConnectivityCheckConfigPanelHandle,
+} from "@/components/usage/ConnectivityCheckConfigPanel";
 import { UsageDashboard } from "@/components/usage/UsageDashboard";
 import { LogConfigPanel } from "@/components/settings/LogConfigPanel";
 import { AuthCenterPanel } from "@/components/settings/AuthCenterPanel";
@@ -110,6 +113,7 @@ export function SettingsPage({
   const [activeTab, setActiveTab] = useState<string>("general");
   const [showRestartPrompt, setShowRestartPrompt] = useState(false);
   const tabScrollContainerRef = useRef<HTMLDivElement>(null);
+  const connectivityCheckRef = useRef<ConnectivityCheckConfigPanelHandle>(null);
 
   useEffect(() => {
     if (open) {
@@ -140,6 +144,9 @@ export function SettingsPage({
 
   const handleSave = useCallback(async () => {
     try {
+      const connectivitySaved = await connectivityCheckRef.current?.save();
+      if (connectivitySaved === false) return;
+
       const result = await saveSettings(undefined, { silent: false });
       if (!result) return;
       if (result.requiresRestart) {
@@ -475,7 +482,9 @@ export function SettingsPage({
                           </div>
                         </AccordionTrigger>
                         <AccordionContent className="px-6 pb-6 pt-4 border-t border-border/50">
-                          <ConnectivityCheckConfigPanel />
+                          <ConnectivityCheckConfigPanel
+                            ref={connectivityCheckRef}
+                          />
                         </AccordionContent>
                       </AccordionItem>
 

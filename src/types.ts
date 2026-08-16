@@ -231,6 +231,11 @@ export interface ProviderMeta {
   providerType?: string;
   // GitHub Copilot 关联账号 ID（旧字段，保留兼容读取）
   githubAccountId?: string;
+  codexModelMapping?: {
+    enabled: boolean;
+    modelMap: Record<string, string>;
+    effortMap: Record<string, string>;
+  };
 }
 
 // Skill 同步方式

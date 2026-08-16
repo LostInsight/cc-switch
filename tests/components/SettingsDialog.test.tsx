@@ -7,6 +7,7 @@ import { SettingsPage } from "@/components/settings/SettingsPage";
 
 const toastSuccessMock = vi.fn();
 const toastErrorMock = vi.fn();
+const connectivitySaveMock = vi.hoisted(() => vi.fn());
 
 vi.mock("sonner", () => ({
   toast: {
@@ -19,6 +20,18 @@ const tMock = vi.fn((key: string) => key);
 vi.mock("react-i18next", () => ({
   useTranslation: () => ({ t: tMock }),
 }));
+
+vi.mock("@/components/usage/ConnectivityCheckConfigPanel", async () => {
+  const React = await import("react");
+  return {
+    ConnectivityCheckConfigPanel: React.forwardRef((_props, ref) => {
+      React.useImperativeHandle(ref, () => ({
+        save: connectivitySaveMock,
+      }));
+      return <div data-testid="connectivity-check-panel" />;
+    }),
+  };
+});
 
 vi.mock("@/hooks/useProxyStatus", () => ({
   useProxyStatus: () => ({
@@ -268,6 +281,8 @@ describe("SettingsPage Component", () => {
     lastUseImportExportOptions = undefined;
     toastSuccessMock.mockReset();
     toastErrorMock.mockReset();
+    connectivitySaveMock.mockReset();
+    connectivitySaveMock.mockResolvedValue(true);
     settingsApi = (await import("@/lib/api")).settingsApi;
     settingsApi.restart.mockClear();
   });
@@ -396,6 +411,25 @@ describe("SettingsPage Component", () => {
       expect(importExportMock.resetStatus).toHaveBeenCalledTimes(2);
       expect(settingsMock.acknowledgeRestart).toHaveBeenCalledTimes(1);
       expect(onOpenChange).toHaveBeenCalledWith(false);
+    });
+  });
+
+  it("saves an opened connectivity panel from the advanced page save button", async () => {
+    renderSettingsPage();
+
+    fireEvent.click(screen.getByText("settings.tabAdvanced"));
+    fireEvent.click(
+      screen.getByText("settings.advanced.connectivityCheck.title"),
+    );
+    expect(
+      await screen.findByTestId("connectivity-check-panel"),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /common\.save/ }));
+
+    await waitFor(() => {
+      expect(connectivitySaveMock).toHaveBeenCalledTimes(1);
+      expect(settingsMock.saveSettings).toHaveBeenCalledTimes(1);
     });
   });
 

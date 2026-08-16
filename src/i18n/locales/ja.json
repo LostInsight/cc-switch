@@ -1370,6 +1370,9 @@
     "reasoningGroupTitle": "思考能力",
     "reasoningSectionHint": "プリセットの供給元は自動的に設定され、カスタム供給元は名前/URL から自動推論されます。自動識別が正しくない場合のみ手動で上書きしてください。",
     "advancedSectionHint": "上流フォーマット、モデルマッピング、思考能力、カスタム User-Agent の設定を含みます。Chat Completions プロトコルを使用するプロバイダーはルーティング引き継ぎの有効化が必要です。",
+    "modelRouteHint": "通常のルート gpt-5.6-terra → gpt-5.6-sol と、思考レベルを指定するルート gpt-5.6-terra@max → gpt-5.6-sol@high の両方に対応します。併用でき、同じモデルに一致した場合は思考レベル指定ルートが優先され、未一致時は通常ルートでユーザーの思考レベルを維持します。未知の思考レベルは警告を表示しますが保存できます。",
+    "modelRouteInvalidEffort": "ルート形式が無効です：{{value}}。model または model@effort を使用し、effort を空欄にしたり空白を含めたりしないでください。",
+    "modelRouteUnknownEffort": "「{{effort}}」は現在既知の Codex 思考レベルではありません。そのまま保存され、リクエスト時に上流が受け入れるかどうかを判断します。",
     "noCommonConfigToApply": "共通設定スニペットが空か、書き込む内容がありません"
   },
   "geminiConfig": {
@@ -2746,13 +2749,22 @@
     "reachableSlow": "{{providerName}} は接続可能だが低速 ({{responseTimeMs}}ms)",
     "unreachable": "{{providerName}} に接続できません: {{message}}",
     "unreachableHint": "接続を確立できませんでした（DNS / 接続 / TLS / タイムアウト）。base_url とネットワークを確認してください。",
-    "connectivityNote": "接続チェックはプロバイダーのアドレスに到達できるかを確認するだけで、実際のモデルリクエストは送信しません。何らかの応答があれば「到達可能」とみなされますが、認証やモデル設定が正しいことを保証するものではありません。",
+    "connectivityNote": "接続チェックは実際のモデルリクエストを送信し、最初のストリーミング応答を待つため、認証・モデル・プロトコルのエラーを検出できます。",
     "configSaved": "接続チェック設定を保存しました",
     "configSaveFailed": "保存に失敗しました",
+    "testModels": "テストモデル",
+    "claudeModel": "Claude テストモデル",
+    "codexModel": "Codex テストモデル",
+    "geminiModel": "Gemini テストモデル",
     "checkParams": "チェックパラメーター",
     "timeout": "タイムアウト（秒）",
     "maxRetries": "最大リトライ回数",
     "degradedThreshold": "低速判定しきい値（ミリ秒）",
+    "promptTemplates": "接続テスト用プロンプト",
+    "promptTemplatesHint": "複数のプロンプトは接続チェックごとに順番に使用されます。{yyyyMMdd} と {random[1-100]} に対応し、乱数範囲は両端を含みます。",
+    "promptTemplate": "プロンプト {{index}}",
+    "addPrompt": "プロンプトを追加",
+    "removePrompt": "プロンプト {{index}} を削除",
     "error": "{{providerName}} のチェックでエラーが発生しました: {{error}}"
   },
   "proxyConfig": {

@@ -310,6 +310,14 @@ pub fn apply_codex_chat_upstream_model(
 /// the chat gating check. Reused by the anthropic conversion path (the forwarder has
 /// already confirmed this provider uses anthropic).
 pub fn apply_codex_upstream_model(provider: &Provider, body: &mut JsonValue) -> Option<String> {
+    // 独立映射启用后，映射器已经处理了明确的来源模型；未配置的模型必须
+    // 原样透传，不能被旧的 catalog/default 逻辑吞掉。
+    if super::super::codex_model_mapper::has_mapping(provider) {
+        return body
+            .get("model")
+            .and_then(|value| value.as_str())
+            .map(ToString::to_string);
+    }
     let catalog_model_ids = codex_provider_catalog_model_ids(provider);
     if let Some(request_model) = body
         .get("model")
