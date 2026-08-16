@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { TFunction } from "i18next";
 import { toast } from "sonner";
+import type { ProviderProxyConfig } from "@/types";
 
 export interface FetchedModel {
   id: string;
@@ -19,6 +20,7 @@ export async function fetchModelsForConfig(
   isFullUrl?: boolean,
   modelsUrl?: string,
   customUserAgent?: string,
+  proxyConfig?: ProviderProxyConfig,
 ): Promise<FetchedModel[]> {
   return invoke("fetch_models_for_config", {
     baseUrl,
@@ -26,6 +28,7 @@ export async function fetchModelsForConfig(
     isFullUrl,
     modelsUrl,
     customUserAgent,
+    proxyConfig,
   });
 }
 

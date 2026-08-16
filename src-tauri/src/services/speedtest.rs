@@ -4,6 +4,7 @@ use serde::Serialize;
 use std::time::Instant;
 
 use crate::error::AppError;
+use crate::provider::ProviderProxyConfig;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 8;
 const MAX_TIMEOUT_SECS: u64 = 30;
@@ -26,6 +27,7 @@ impl SpeedtestService {
     pub async fn test_endpoints(
         urls: Vec<String>,
         timeout_secs: Option<u64>,
+        proxy_config: Option<&ProviderProxyConfig>,
     ) -> Result<Vec<EndpointLatency>, AppError> {
         if urls.is_empty() {
             return Ok(vec![]);
@@ -65,7 +67,7 @@ impl SpeedtestService {
         }
 
         let timeout = Self::sanitize_timeout(timeout_secs);
-        let (client, request_timeout) = Self::build_client(timeout)?;
+        let (client, request_timeout) = Self::build_client(timeout, proxy_config)?;
 
         let tasks = valid_targets.into_iter().map(|(idx, trimmed, parsed_url)| {
             let client = client.clone();
@@ -116,11 +118,16 @@ impl SpeedtestService {
         Ok(results.into_iter().flatten().collect::<Vec<_>>())
     }
 
-    fn build_client(timeout_secs: u64) -> Result<(Client, std::time::Duration), AppError> {
-        // 使用全局 HTTP 客户端（已包含代理配置）
-        // 返回 timeout Duration 供请求级别使用
+    fn build_client(
+        timeout_secs: u64,
+        proxy_config: Option<&ProviderProxyConfig>,
+    ) -> Result<(Client, std::time::Duration), AppError> {
+        // 使用当前 Provider 解析后的客户端，并返回请求级超时。
         let timeout = std::time::Duration::from_secs(timeout_secs);
-        Ok((crate::proxy::http_client::get(), timeout))
+        let client = crate::proxy::http_client::get_for_provider(proxy_config)
+            .map_err(AppError::Message)?
+            .client;
+        Ok((client, timeout))
     }
 
     fn sanitize_timeout(timeout_secs: Option<u64>) -> u64 {
@@ -155,9 +162,12 @@ mod tests {
 
     #[test]
     fn test_endpoints_handles_empty_list() {
-        let result =
-            tauri::async_runtime::block_on(SpeedtestService::test_endpoints(Vec::new(), Some(5)))
-                .expect("empty list should succeed");
+        let result = tauri::async_runtime::block_on(SpeedtestService::test_endpoints(
+            Vec::new(),
+            Some(5),
+            None,
+        ))
+        .expect("empty list should succeed");
         assert!(result.is_empty());
     }
 
@@ -165,6 +175,7 @@ mod tests {
     fn test_endpoints_reports_invalid_url() {
         let result = tauri::async_runtime::block_on(SpeedtestService::test_endpoints(
             vec!["not a url".into(), "".into()],
+            None,
             None,
         ))
         .expect("invalid inputs should still succeed");

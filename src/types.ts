@@ -168,8 +168,24 @@ export interface LocalProxyRequestOverrides {
   body?: Record<string, unknown>;
 }
 
+export type ProviderProxyMode = "inherit" | "custom" | "direct";
+
+export interface ProviderProxyConfig {
+  mode?: ProviderProxyMode;
+  url?: string;
+  // Legacy fields retained for importing older provider metadata.
+  enabled?: boolean;
+  proxyType?: "http" | "https" | "socks5" | "socks5h";
+  proxyHost?: string;
+  proxyPort?: number;
+  proxyUsername?: string;
+  proxyPassword?: string;
+}
+
 // 供应商元数据（字段名与后端一致，保持 snake_case）
 export interface ProviderMeta {
+  // Provider-specific outbound proxy selection. Missing data inherits global proxy.
+  proxyConfig?: ProviderProxyConfig;
   // 自定义端点：以 URL 为键，值为端点信息
   custom_endpoints?: Record<string, CustomEndpoint>;
   // 是否在切换/同步到 live 时应用通用配置片段

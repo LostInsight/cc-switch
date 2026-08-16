@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { CustomEndpoint } from "@/types";
+import type { CustomEndpoint, ProviderProxyConfig } from "@/types";
 import type { AppId } from "./types";
 
 export interface EndpointLatencyResult {
@@ -16,11 +16,12 @@ export const vscodeApi = {
 
   async testApiEndpoints(
     urls: string[],
-    options?: { timeoutSecs?: number },
+    options?: { timeoutSecs?: number; proxyConfig?: ProviderProxyConfig },
   ): Promise<EndpointLatencyResult[]> {
     return await invoke("test_api_endpoints", {
       urls,
       timeoutSecs: options?.timeoutSecs,
+      proxyConfig: options?.proxyConfig,
     });
   },
 

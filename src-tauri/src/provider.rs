@@ -421,6 +421,85 @@ impl LocalProxyRequestOverrides {
     }
 }
 
+/// Provider 级出站代理模式。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderProxyMode {
+    /// 跟随全局出站代理（全局未显式配置时继续沿用系统代理）。
+    #[default]
+    Inherit,
+    /// 使用 Provider 自己的代理 URL。
+    Custom,
+    /// 明确禁用显式代理和系统代理。
+    Direct,
+}
+
+/// Provider 级出站代理配置。
+///
+/// `enabled` 与拆分字段仅用于兼容功能移除前保存的旧数据；新数据只写入
+/// `mode` 和 `url`。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ProviderProxyConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<ProviderProxyMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(rename = "proxyType", skip_serializing_if = "Option::is_none")]
+    pub proxy_type: Option<String>,
+    #[serde(rename = "proxyHost", skip_serializing_if = "Option::is_none")]
+    pub proxy_host: Option<String>,
+    #[serde(rename = "proxyPort", skip_serializing_if = "Option::is_none")]
+    pub proxy_port: Option<u16>,
+    #[serde(rename = "proxyUsername", skip_serializing_if = "Option::is_none")]
+    pub proxy_username: Option<String>,
+    #[serde(rename = "proxyPassword", skip_serializing_if = "Option::is_none")]
+    pub proxy_password: Option<String>,
+}
+
+impl ProviderProxyConfig {
+    pub fn effective_mode(&self) -> ProviderProxyMode {
+        self.mode.unwrap_or_else(|| {
+            if self.enabled.unwrap_or(false) {
+                ProviderProxyMode::Custom
+            } else {
+                ProviderProxyMode::Inherit
+            }
+        })
+    }
+
+    pub fn custom_url(&self) -> Option<String> {
+        if let Some(url) = self
+            .url
+            .as_deref()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+        {
+            return Some(url.to_string());
+        }
+
+        let host = self.proxy_host.as_deref()?.trim();
+        let port = self.proxy_port?;
+        if host.is_empty() {
+            return None;
+        }
+        let scheme = self.proxy_type.as_deref().unwrap_or("http");
+        let credentials = match (
+            self.proxy_username
+                .as_deref()
+                .filter(|value| !value.is_empty()),
+            self.proxy_password
+                .as_deref()
+                .filter(|value| !value.is_empty()),
+        ) {
+            (Some(username), Some(password)) => format!("{username}:{password}@"),
+            _ => String::new(),
+        };
+        Some(format!("{scheme}://{credentials}{host}:{port}"))
+    }
+}
+
 /// 供应商元数据
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProviderMeta {
@@ -449,6 +528,9 @@ pub struct ProviderMeta {
     /// 请求地址管理：测速后自动选择最佳端点
     #[serde(rename = "endpointAutoSelect", skip_serializing_if = "Option::is_none")]
     pub endpoint_auto_select: Option<bool>,
+    /// Provider 独立出站代理；缺失时跟随全局代理。
+    #[serde(rename = "proxyConfig", skip_serializing_if = "Option::is_none")]
+    pub proxy_config: Option<ProviderProxyConfig>,
     /// 合作伙伴标记（前端使用 isPartner，保持字段名一致）
     #[serde(rename = "isPartner", skip_serializing_if = "Option::is_none")]
     pub is_partner: Option<bool>,
@@ -1002,7 +1084,8 @@ pub struct OpenCodeModelLimit {
 mod tests {
     use super::{
         ClaudeModelConfig, CodexModelConfig, GeminiModelConfig, LocalProxyRequestOverrides,
-        OpenCodeProviderConfig, Provider, ProviderManager, ProviderMeta, UniversalProvider,
+        OpenCodeProviderConfig, Provider, ProviderManager, ProviderMeta, ProviderProxyConfig,
+        ProviderProxyMode, UniversalProvider,
     };
     use serde_json::json;
     use std::collections::HashMap;
@@ -1031,6 +1114,56 @@ mod tests {
         let value = serde_json::to_value(&meta).expect("serialize ProviderMeta");
 
         assert!(value.get("pricingModelSource").is_none());
+    }
+
+    #[test]
+    fn provider_meta_roundtrips_outbound_proxy_modes() {
+        for config in [
+            ProviderProxyConfig {
+                mode: Some(ProviderProxyMode::Custom),
+                url: Some("socks5h://127.0.0.1:1080".to_string()),
+                ..Default::default()
+            },
+            ProviderProxyConfig {
+                mode: Some(ProviderProxyMode::Direct),
+                ..Default::default()
+            },
+        ] {
+            let meta = ProviderMeta {
+                proxy_config: Some(config),
+                ..Default::default()
+            };
+            let value = serde_json::to_value(&meta).expect("serialize ProviderMeta");
+            assert!(value.get("proxyConfig").is_some());
+
+            let decoded: ProviderMeta =
+                serde_json::from_value(value).expect("deserialize ProviderMeta");
+            assert_eq!(
+                decoded
+                    .proxy_config
+                    .as_ref()
+                    .map(|proxy| proxy.effective_mode()),
+                meta.proxy_config
+                    .as_ref()
+                    .map(|proxy| proxy.effective_mode())
+            );
+        }
+    }
+
+    #[test]
+    fn provider_meta_reads_legacy_outbound_proxy_as_custom() {
+        let meta: ProviderMeta = serde_json::from_value(json!({
+            "proxyConfig": {
+                "enabled": true,
+                "proxyType": "http",
+                "proxyHost": "127.0.0.1",
+                "proxyPort": 7890
+            }
+        }))
+        .expect("deserialize legacy ProviderMeta");
+        let proxy = meta.proxy_config.expect("legacy proxy config");
+        assert_eq!(proxy.effective_mode(), ProviderProxyMode::Custom);
+        assert_eq!(proxy.custom_url().as_deref(), Some("http://127.0.0.1:7890"));
     }
 
     #[test]

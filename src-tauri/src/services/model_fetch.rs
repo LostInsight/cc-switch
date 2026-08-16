@@ -9,6 +9,8 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+use crate::provider::ProviderProxyConfig;
+
 /// 获取到的模型信息
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -57,13 +59,14 @@ pub async fn fetch_models(
     is_full_url: bool,
     models_url_override: Option<&str>,
     user_agent: Option<HeaderValue>,
+    proxy_config: Option<&ProviderProxyConfig>,
 ) -> Result<Vec<FetchedModel>, String> {
     if api_key.is_empty() {
         return Err("API Key is required to fetch models".to_string());
     }
 
     let candidates = build_models_url_candidates(base_url, is_full_url, models_url_override)?;
-    let client = crate::proxy::http_client::get();
+    let client = crate::proxy::http_client::get_for_provider(proxy_config)?.client;
     let mut last_err: Option<String> = None;
     let log_secrets = vec![api_key.to_string()];
 

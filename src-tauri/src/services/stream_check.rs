@@ -296,8 +296,14 @@ impl StreamCheckService {
             .or_else(|| adapter.extract_auth(provider))
             .ok_or_else(|| AppError::Message("API Key not found".to_string()))?;
 
-        // 获取 HTTP 客户端
-        let client = crate::proxy::http_client::get();
+        let client = crate::proxy::http_client::get_for_provider(
+            provider
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.proxy_config.as_ref()),
+        )
+        .map_err(AppError::Message)?
+        .client;
         let request_timeout = std::time::Duration::from_secs(config.timeout_secs);
 
         let model_to_test = Self::resolve_test_model(app_type, provider, config);
@@ -803,8 +809,14 @@ impl StreamCheckService {
         config: &StreamCheckConfig,
         start: Instant,
     ) -> Result<StreamCheckResult, AppError> {
-        // 获取 HTTP 客户端
-        let client = crate::proxy::http_client::get();
+        let client = crate::proxy::http_client::get_for_provider(
+            provider
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.proxy_config.as_ref()),
+        )
+        .map_err(AppError::Message)?
+        .client;
         let request_timeout = std::time::Duration::from_secs(config.timeout_secs);
 
         let model_to_test = Self::resolve_test_model(app_type, provider, config);

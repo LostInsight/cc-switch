@@ -10,6 +10,22 @@ use std::net::IpAddr;
 use std::sync::RwLock;
 use std::time::Duration;
 
+use crate::provider::{ProviderProxyConfig, ProviderProxyMode};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedProviderProxy {
+    Inherit,
+    Custom(String),
+    Direct,
+}
+
+pub struct ProviderHttpClient {
+    pub client: Client,
+    /// 仅供 raw hyper 转发使用。`None` 同时覆盖继承时无显式全局代理和明确直连；
+    /// 两者对 reqwest 的差异已经体现在 `client` 中。
+    pub proxy_url: Option<String>,
+}
+
 /// 全局 HTTP 客户端实例
 static GLOBAL_CLIENT: OnceCell<RwLock<Client>> = OnceCell::new();
 
@@ -213,8 +229,8 @@ pub fn is_proxy_enabled() -> bool {
 }
 
 /// 构建 HTTP 客户端
-fn build_client(proxy_url: Option<&str>) -> Result<Client, String> {
-    let mut builder = Client::builder()
+fn base_client_builder() -> reqwest::ClientBuilder {
+    Client::builder()
         .timeout(Duration::from_secs(600))
         .connect_timeout(Duration::from_secs(30))
         .pool_max_idle_per_host(10)
@@ -224,7 +240,11 @@ fn build_client(proxy_url: Option<&str>) -> Result<Client, String> {
         .no_gzip()
         .no_brotli()
         .no_deflate()
-        .no_zstd();
+        .no_zstd()
+}
+
+fn build_client(proxy_url: Option<&str>) -> Result<Client, String> {
+    let mut builder = base_client_builder();
 
     // 有代理地址则使用代理，否则跟随系统代理
     if let Some(url) = proxy_url {
@@ -261,6 +281,53 @@ fn build_client(proxy_url: Option<&str>) -> Result<Client, String> {
     builder
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {e}"))
+}
+
+fn build_direct_client() -> Result<Client, String> {
+    base_client_builder()
+        .no_proxy()
+        .build()
+        .map_err(|e| format!("Failed to build direct HTTP client: {e}"))
+}
+
+pub fn resolve_provider_proxy(
+    proxy_config: Option<&ProviderProxyConfig>,
+) -> Result<ResolvedProviderProxy, String> {
+    let Some(config) = proxy_config else {
+        return Ok(ResolvedProviderProxy::Inherit);
+    };
+
+    match config.effective_mode() {
+        ProviderProxyMode::Inherit => Ok(ResolvedProviderProxy::Inherit),
+        ProviderProxyMode::Direct => Ok(ResolvedProviderProxy::Direct),
+        ProviderProxyMode::Custom => {
+            let url = config
+                .custom_url()
+                .ok_or_else(|| "Provider custom proxy URL is empty".to_string())?;
+            // 与全局代理共用同一套 URL/scheme 校验。
+            build_client(Some(&url))?;
+            Ok(ResolvedProviderProxy::Custom(url))
+        }
+    }
+}
+
+pub fn get_for_provider(
+    proxy_config: Option<&ProviderProxyConfig>,
+) -> Result<ProviderHttpClient, String> {
+    match resolve_provider_proxy(proxy_config)? {
+        ResolvedProviderProxy::Inherit => Ok(ProviderHttpClient {
+            client: get(),
+            proxy_url: get_current_proxy_url(),
+        }),
+        ResolvedProviderProxy::Custom(url) => Ok(ProviderHttpClient {
+            client: build_client(Some(&url))?,
+            proxy_url: Some(url),
+        }),
+        ResolvedProviderProxy::Direct => Ok(ProviderHttpClient {
+            client: build_direct_client()?,
+            proxy_url: None,
+        }),
+    }
 }
 
 fn system_proxy_points_to_loopback() -> bool {
@@ -390,6 +457,57 @@ mod tests {
         // 使用明确无效的 scheme 来触发错误
         let result = build_client(Some("invalid-scheme://127.0.0.1:7890"));
         assert!(result.is_err(), "Should reject invalid proxy scheme");
+    }
+
+    #[test]
+    fn provider_proxy_modes_resolve_without_mutating_global_state() {
+        let custom = ProviderProxyConfig {
+            mode: Some(ProviderProxyMode::Custom),
+            url: Some("socks5h://127.0.0.1:1080".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_provider_proxy(Some(&custom)).unwrap(),
+            ResolvedProviderProxy::Custom("socks5h://127.0.0.1:1080".to_string())
+        );
+
+        let direct = ProviderProxyConfig {
+            mode: Some(ProviderProxyMode::Direct),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_provider_proxy(Some(&direct)).unwrap(),
+            ResolvedProviderProxy::Direct
+        );
+        assert_eq!(
+            resolve_provider_proxy(None).unwrap(),
+            ResolvedProviderProxy::Inherit
+        );
+    }
+
+    #[test]
+    fn legacy_provider_proxy_config_resolves_as_custom() {
+        let legacy = ProviderProxyConfig {
+            enabled: Some(true),
+            proxy_type: Some("http".to_string()),
+            proxy_host: Some("127.0.0.1".to_string()),
+            proxy_port: Some(7890),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_provider_proxy(Some(&legacy)).unwrap(),
+            ResolvedProviderProxy::Custom("http://127.0.0.1:7890".to_string())
+        );
+    }
+
+    #[test]
+    fn invalid_custom_provider_proxy_is_rejected_instead_of_falling_back() {
+        let invalid = ProviderProxyConfig {
+            mode: Some(ProviderProxyMode::Custom),
+            url: Some("ftp://proxy.example.com".to_string()),
+            ..Default::default()
+        };
+        assert!(resolve_provider_proxy(Some(&invalid)).is_err());
     }
 
     #[test]
