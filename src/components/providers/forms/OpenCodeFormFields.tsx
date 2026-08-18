@@ -59,9 +59,10 @@ function ModelIdInput({
     <ImeSafeInput
       value={localValue}
       onValueChange={setLocalValue}
-      onBlur={() => {
-        if (localValue !== modelId && localValue.trim()) {
-          onChange(localValue);
+      onBlur={(event) => {
+        const nextValue = event.currentTarget.value;
+        if (nextValue !== modelId && nextValue.trim()) {
+          onChange(nextValue);
         }
       }}
       placeholder={placeholder}
@@ -101,8 +102,8 @@ function ExtraOptionKeyInput({
     <ImeSafeInput
       value={localValue}
       onValueChange={setLocalValue}
-      onBlur={() => {
-        const trimmed = localValue.trim();
+      onBlur={(event) => {
+        const trimmed = event.currentTarget.value.trim();
         if (trimmed && trimmed !== optionKey) {
           const accepted = onChange(trimmed);
           if (accepted === false) {
@@ -140,8 +141,8 @@ function ModelOptionKeyInput({
     <ImeSafeInput
       value={localValue}
       onValueChange={setLocalValue}
-      onBlur={() => {
-        const trimmed = localValue.trim();
+      onBlur={(event) => {
+        const trimmed = event.currentTarget.value.trim();
         if (trimmed && trimmed !== optionKey) {
           onChange(trimmed);
         }
