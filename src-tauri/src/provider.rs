@@ -522,6 +522,69 @@ impl ProviderProxyConfig {
     }
 }
 
+/// Provider-specific cross-provider failover action for an upstream HTTP status.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum HttpFailoverAction {
+    Failover,
+    Stop,
+}
+
+/// Explicit per-status overrides. Missing statuses inherit the existing classifier.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct ProviderFailoverPolicy {
+    #[serde(
+        default,
+        rename = "httpStatusOverrides",
+        skip_serializing_if = "HashMap::is_empty",
+        deserialize_with = "deserialize_http_status_overrides"
+    )]
+    pub http_status_overrides: HashMap<u16, HttpFailoverAction>,
+}
+
+impl ProviderFailoverPolicy {
+    pub fn is_empty(&self) -> bool {
+        self.http_status_overrides.is_empty()
+    }
+}
+
+fn failover_policy_is_empty(policy: &Option<ProviderFailoverPolicy>) -> bool {
+    policy
+        .as_ref()
+        .map(ProviderFailoverPolicy::is_empty)
+        .unwrap_or(true)
+}
+
+fn deserialize_http_status_overrides<'de, D>(
+    deserializer: D,
+) -> Result<HashMap<u16, HttpFailoverAction>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = HashMap::<String, HttpFailoverAction>::deserialize(deserializer)?;
+    let mut overrides = HashMap::with_capacity(raw.len());
+
+    for (raw_status, action) in raw {
+        let status = raw_status.parse::<u16>().map_err(|_| {
+            serde::de::Error::custom(format!(
+                "invalid HTTP failover status '{raw_status}': expected an integer from 400 to 599"
+            ))
+        })?;
+        if !(400..=599).contains(&status) {
+            return Err(serde::de::Error::custom(format!(
+                "invalid HTTP failover status '{raw_status}': expected 400 to 599"
+            )));
+        }
+        if overrides.insert(status, action).is_some() {
+            return Err(serde::de::Error::custom(format!(
+                "duplicate HTTP failover status '{status}'"
+            )));
+        }
+    }
+
+    Ok(overrides)
+}
+
 /// 供应商元数据
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProviderMeta {
@@ -553,6 +616,12 @@ pub struct ProviderMeta {
     /// Provider 独立出站代理；缺失时跟随全局代理。
     #[serde(rename = "proxyConfig", skip_serializing_if = "Option::is_none")]
     pub proxy_config: Option<ProviderProxyConfig>,
+    /// Provider-specific upstream HTTP status overrides for cross-provider failover.
+    #[serde(
+        rename = "failoverPolicy",
+        skip_serializing_if = "failover_policy_is_empty"
+    )]
+    pub failover_policy: Option<ProviderFailoverPolicy>,
     /// 合作伙伴标记（前端使用 isPartner，保持字段名一致）
     #[serde(rename = "isPartner", skip_serializing_if = "Option::is_none")]
     pub is_partner: Option<bool>,
@@ -678,6 +747,14 @@ pub fn parse_custom_user_agent(
 }
 
 impl ProviderMeta {
+    /// Resolve only an explicit status override. `None` means inherit existing behavior.
+    pub fn http_failover_action(&self, status: u16) -> Option<HttpFailoverAction> {
+        self.failover_policy
+            .as_ref()
+            .and_then(|policy| policy.http_status_overrides.get(&status))
+            .copied()
+    }
+
     /// Codex OAuth FAST mode 是否启用。默认关闭，因为 `service_tier="priority"`
     /// 会按更高速率消耗 ChatGPT 订阅配额，用户需显式开启以换取更低延迟。
     pub fn codex_fast_mode_enabled(&self) -> bool {
@@ -1105,9 +1182,9 @@ pub struct OpenCodeModelLimit {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClaudeModelConfig, CodexModelConfig, GeminiModelConfig, LocalProxyRequestOverrides,
-        OpenCodeProviderConfig, Provider, ProviderManager, ProviderMeta, ProviderProxyConfig,
-        ProviderProxyMode, UniversalProvider,
+        ClaudeModelConfig, CodexModelConfig, GeminiModelConfig, HttpFailoverAction,
+        LocalProxyRequestOverrides, OpenCodeProviderConfig, Provider, ProviderFailoverPolicy,
+        ProviderManager, ProviderMeta, ProviderProxyConfig, ProviderProxyMode, UniversalProvider,
     };
     use serde_json::json;
     use std::collections::HashMap;
@@ -1186,6 +1263,69 @@ mod tests {
         let proxy = meta.proxy_config.expect("legacy proxy config");
         assert_eq!(proxy.effective_mode(), ProviderProxyMode::Custom);
         assert_eq!(proxy.custom_url().as_deref(), Some("http://127.0.0.1:7890"));
+    }
+
+    #[test]
+    fn provider_meta_http_failover_policy_roundtrips_explicit_overrides() {
+        let meta = ProviderMeta {
+            failover_policy: Some(ProviderFailoverPolicy {
+                http_status_overrides: HashMap::from([
+                    (400, HttpFailoverAction::Failover),
+                    (429, HttpFailoverAction::Stop),
+                    (529, HttpFailoverAction::Failover),
+                ]),
+            }),
+            ..ProviderMeta::default()
+        };
+
+        let value = serde_json::to_value(&meta).expect("serialize ProviderMeta");
+        assert_eq!(
+            value["failoverPolicy"]["httpStatusOverrides"]["400"],
+            "failover"
+        );
+        assert_eq!(
+            value["failoverPolicy"]["httpStatusOverrides"]["429"],
+            "stop"
+        );
+
+        let decoded: ProviderMeta =
+            serde_json::from_value(value).expect("deserialize ProviderMeta");
+        assert_eq!(
+            decoded.http_failover_action(400),
+            Some(HttpFailoverAction::Failover)
+        );
+        assert_eq!(
+            decoded.http_failover_action(429),
+            Some(HttpFailoverAction::Stop)
+        );
+        assert_eq!(decoded.http_failover_action(502), None);
+    }
+
+    #[test]
+    fn provider_meta_legacy_and_empty_failover_policy_serialize_as_inherit() {
+        let legacy: ProviderMeta =
+            serde_json::from_value(json!({ "proxyConfig": { "mode": "direct" } }))
+                .expect("deserialize legacy ProviderMeta");
+        assert_eq!(legacy.http_failover_action(400), None);
+
+        let value = serde_json::to_value(ProviderMeta {
+            failover_policy: Some(ProviderFailoverPolicy::default()),
+            ..ProviderMeta::default()
+        })
+        .expect("serialize empty failover policy");
+        assert!(value.get("failoverPolicy").is_none());
+    }
+
+    #[test]
+    fn provider_meta_rejects_invalid_http_failover_policy() {
+        for value in [
+            json!({ "failoverPolicy": { "httpStatusOverrides": { "399": "failover" } } }),
+            json!({ "failoverPolicy": { "httpStatusOverrides": { "600": "stop" } } }),
+            json!({ "failoverPolicy": { "httpStatusOverrides": { "oops": "stop" } } }),
+            json!({ "failoverPolicy": { "httpStatusOverrides": { "400": "retry" } } }),
+        ] {
+            assert!(serde_json::from_value::<ProviderMeta>(value).is_err());
+        }
     }
 
     #[test]

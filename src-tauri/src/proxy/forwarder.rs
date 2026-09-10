@@ -27,7 +27,7 @@ use crate::proxy::providers::copilot_auth::CopilotAuthManager;
 use crate::proxy::providers::xai_oauth_auth::XaiOAuthManager;
 use crate::{
     app_config::AppType,
-    provider::{LocalProxyRequestOverrides, Provider},
+    provider::{HttpFailoverAction, LocalProxyRequestOverrides, Provider},
 };
 use bytes::Bytes;
 use futures::StreamExt;
@@ -317,7 +317,17 @@ impl RequestForwarder {
         // 客户端错误：整流后请求仍违法，下一家也修不好 → 直接返回。
         let is_provider_error = match &retry_err {
             ProxyError::Timeout(_) | ProxyError::ForwardFailed(_) => true,
-            ProxyError::UpstreamError { status, .. } => *status >= 500,
+            ProxyError::UpstreamError { status, .. } => {
+                self.categorize_upstream_http_error(
+                    provider,
+                    *status,
+                    if *status >= 500 {
+                        ErrorCategory::Retryable
+                    } else {
+                        ErrorCategory::NonRetryable
+                    },
+                ) == ErrorCategory::Retryable
+            }
             _ => false,
         };
 
@@ -2727,10 +2737,14 @@ impl RequestForwarder {
             //
             // 其他 4xx（401/403/404/408/409/429/451 等）和全部 5xx 都保留
             // Retryable —— 换一家 provider 可能持有不同的 key、配额、地域或模型映射。
-            ProxyError::UpstreamError { status, .. } => match *status {
-                400 | 405 | 406 | 413 | 414 | 415 | 422 | 501 => ErrorCategory::NonRetryable,
-                _ => ErrorCategory::Retryable,
-            },
+            ProxyError::UpstreamError { status, .. } => self.categorize_upstream_http_error(
+                provider,
+                *status,
+                match *status {
+                    400 | 405 | 406 | 413 | 414 | 415 | 422 | 501 => ErrorCategory::NonRetryable,
+                    _ => ErrorCategory::Retryable,
+                },
+            ),
             // Provider 级配置/转换问题：换一个 Provider 可能就能成功
             ProxyError::ConfigError(_) => ErrorCategory::Retryable,
             ProxyError::TransformError(_) => ErrorCategory::Retryable,
@@ -2740,6 +2754,29 @@ impl RequestForwarder {
             ProxyError::NoAvailableProvider => ErrorCategory::NonRetryable,
             // 其他错误（数据库/内部错误等）：不是换供应商能解决的问题
             _ => ErrorCategory::NonRetryable,
+        }
+    }
+
+    fn categorize_upstream_http_error(
+        &self,
+        provider: &Provider,
+        status: u16,
+        inherited: ErrorCategory,
+    ) -> ErrorCategory {
+        // Official Codex routes must never switch accounts/providers, including
+        // rectifier failure paths that bypass the central classifier.
+        if super::providers::is_codex_official_provider(provider) {
+            return ErrorCategory::NonRetryable;
+        }
+
+        match provider
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.http_failover_action(status))
+        {
+            Some(HttpFailoverAction::Failover) => ErrorCategory::Retryable,
+            Some(HttpFailoverAction::Stop) => ErrorCategory::NonRetryable,
+            None => inherited,
         }
     }
 }
@@ -3682,13 +3719,20 @@ fn value_for_log(value: &Value) -> String {
 mod tests {
     use super::*;
     use crate::database::Database;
-    use crate::provider::LocalProxyRequestOverrides;
+    use crate::provider::{
+        HttpFailoverAction, LocalProxyRequestOverrides, ProviderFailoverPolicy, ProviderMeta,
+        ProviderProxyConfig, ProviderProxyMode,
+    };
     use axum::http::header::{HeaderValue, ACCEPT};
     use axum::http::HeaderMap;
+    use axum::response::IntoResponse;
+    use axum::routing::any;
+    use axum::{Json, Router};
     use bytes::Bytes;
     use http::StatusCode;
     use serde_json::json;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     fn test_provider_with_type(provider_type: Option<&str>) -> Provider {
@@ -3709,6 +3753,143 @@ mod tests {
             icon_color: None,
             in_failover_queue: false,
         }
+    }
+
+    fn test_provider_with_http_overrides(
+        overrides: impl IntoIterator<Item = (u16, HttpFailoverAction)>,
+    ) -> Provider {
+        let mut provider = test_provider_with_type(None);
+        provider.meta = Some(ProviderMeta {
+            failover_policy: Some(ProviderFailoverPolicy {
+                http_status_overrides: overrides.into_iter().collect(),
+            }),
+            ..ProviderMeta::default()
+        });
+        provider
+    }
+
+    async fn spawn_status_upstream(
+        status: StatusCode,
+    ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let requests_for_route = requests.clone();
+        let app = Router::new().fallback(any(move || {
+            let requests = requests_for_route.clone();
+            async move {
+                requests.fetch_add(1, Ordering::SeqCst);
+                if status.is_success() {
+                    (
+                        status,
+                        Json(json!({
+                            "id": "msg_test",
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{ "type": "text", "text": "ok" }],
+                            "model": "claude-test",
+                            "stop_reason": "end_turn",
+                            "usage": { "input_tokens": 1, "output_tokens": 1 }
+                        })),
+                    )
+                        .into_response()
+                } else {
+                    (
+                        status,
+                        Json(json!({ "error": { "message": "upstream rejected request" } })),
+                    )
+                        .into_response()
+                }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind test upstream");
+        let addr = listener.local_addr().expect("test upstream address");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve test upstream");
+        });
+        (format!("http://{addr}"), requests, handle)
+    }
+
+    fn test_claude_upstream_provider(
+        id: &str,
+        base_url: &str,
+        override_action: Option<(u16, HttpFailoverAction)>,
+    ) -> Provider {
+        let mut provider = Provider::with_id(
+            id.to_string(),
+            format!("Provider {id}"),
+            json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": base_url,
+                    "ANTHROPIC_AUTH_TOKEN": "test-key"
+                }
+            }),
+            None,
+        );
+        provider.meta = Some(ProviderMeta {
+            failover_policy: override_action.map(|(status, action)| ProviderFailoverPolicy {
+                http_status_overrides: HashMap::from([(status, action)]),
+            }),
+            proxy_config: Some(ProviderProxyConfig {
+                mode: Some(ProviderProxyMode::Direct),
+                ..ProviderProxyConfig::default()
+            }),
+            ..ProviderMeta::default()
+        });
+        provider
+    }
+
+    async fn run_http_failover_case(
+        status: u16,
+        action: Option<HttpFailoverAction>,
+        should_reach_b: bool,
+    ) {
+        let (base_url_a, requests_a, handle_a) =
+            spawn_status_upstream(StatusCode::from_u16(status).expect("valid test status")).await;
+        let (base_url_b, requests_b, handle_b) = spawn_status_upstream(StatusCode::OK).await;
+        let provider_a =
+            test_claude_upstream_provider("a", &base_url_a, action.map(|value| (status, value)));
+        let provider_b = test_claude_upstream_provider("b", &base_url_b, None);
+        let mut forwarder = test_forwarder(Duration::from_secs(5), Duration::from_secs(5));
+        forwarder.max_attempts = 2;
+
+        let result = forwarder
+            .forward_with_retry(
+                &AppType::Claude,
+                http::Method::POST,
+                "/v1/messages",
+                json!({
+                    "model": "claude-test",
+                    "max_tokens": 64,
+                    "messages": [{ "role": "user", "content": "test" }],
+                    "stream": false
+                }),
+                HeaderMap::new(),
+                Extensions::new(),
+                vec![provider_a, provider_b],
+            )
+            .await;
+
+        assert_eq!(requests_a.load(Ordering::SeqCst), 1, "status {status}");
+        assert_eq!(
+            requests_b.load(Ordering::SeqCst),
+            usize::from(should_reach_b),
+            "status {status}"
+        );
+        if should_reach_b {
+            let Ok(result) = result else {
+                panic!("provider B should succeed for status {status}");
+            };
+            assert_eq!(result.provider.id, "b");
+        } else {
+            assert!(result.is_err(), "status {status} should stop at provider A");
+        }
+
+        handle_a.abort();
+        handle_b.abort();
     }
 
     fn test_forwarder(
@@ -4488,9 +4669,139 @@ mod tests {
     }
 
     #[test]
+    fn upstream_http_failover_overrides_precede_default_status_classification() {
+        let forwarder = test_forwarder(Duration::ZERO, Duration::ZERO);
+        let provider = test_provider_with_http_overrides([
+            (400, HttpFailoverAction::Failover),
+            (405, HttpFailoverAction::Failover),
+            (429, HttpFailoverAction::Stop),
+            (502, HttpFailoverAction::Failover),
+        ]);
+
+        for status in [400, 405, 502] {
+            assert_eq!(
+                forwarder.categorize_proxy_error(
+                    &ProxyError::UpstreamError { status, body: None },
+                    &provider,
+                ),
+                ErrorCategory::Retryable
+            );
+        }
+        assert_eq!(
+            forwarder.categorize_proxy_error(
+                &ProxyError::UpstreamError {
+                    status: 429,
+                    body: None,
+                },
+                &provider,
+            ),
+            ErrorCategory::NonRetryable
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_http_overrides_drive_only_cross_provider_failover() {
+        for (status, action, should_reach_b) in [
+            (400, Some(HttpFailoverAction::Failover), true),
+            (405, Some(HttpFailoverAction::Failover), true),
+            (400, None, false),
+            (429, None, true),
+            (429, Some(HttpFailoverAction::Stop), false),
+            (502, Some(HttpFailoverAction::Failover), true),
+            (529, Some(HttpFailoverAction::Failover), true),
+        ] {
+            run_http_failover_case(status, action, should_reach_b).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn failover_override_does_not_retry_a_when_no_next_provider_exists() {
+        let (base_url_a, requests_a, handle_a) =
+            spawn_status_upstream(StatusCode::BAD_REQUEST).await;
+        let provider_a = test_claude_upstream_provider(
+            "a",
+            &base_url_a,
+            Some((400, HttpFailoverAction::Failover)),
+        );
+        let mut forwarder = test_forwarder(Duration::from_secs(5), Duration::from_secs(5));
+        forwarder.max_attempts = 2;
+
+        let result = forwarder
+            .forward_with_retry(
+                &AppType::Claude,
+                http::Method::POST,
+                "/v1/messages",
+                json!({
+                    "model": "claude-test",
+                    "max_tokens": 64,
+                    "messages": [{ "role": "user", "content": "test" }],
+                    "stream": false
+                }),
+                HeaderMap::new(),
+                Extensions::new(),
+                vec![provider_a],
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(requests_a.load(Ordering::SeqCst), 1);
+        handle_a.abort();
+    }
+
+    #[test]
+    fn inherited_http_statuses_and_provider_policies_remain_independent() {
+        let forwarder = test_forwarder(Duration::ZERO, Duration::ZERO);
+        let provider_a = test_provider_with_http_overrides([(400, HttpFailoverAction::Failover)]);
+        let provider_b = test_provider_with_http_overrides([(400, HttpFailoverAction::Stop)]);
+        let inherited = test_provider_with_type(None);
+        let error_400 = ProxyError::UpstreamError {
+            status: 400,
+            body: None,
+        };
+        let error_429 = ProxyError::UpstreamError {
+            status: 429,
+            body: None,
+        };
+
+        assert_eq!(
+            forwarder.categorize_proxy_error(&error_400, &provider_a),
+            ErrorCategory::Retryable
+        );
+        assert_eq!(
+            forwarder.categorize_proxy_error(&error_400, &provider_b),
+            ErrorCategory::NonRetryable
+        );
+        assert_eq!(
+            forwarder.categorize_proxy_error(&error_400, &inherited),
+            ErrorCategory::NonRetryable
+        );
+        assert_eq!(
+            forwarder.categorize_proxy_error(&error_429, &inherited),
+            ErrorCategory::Retryable
+        );
+    }
+
+    #[test]
+    fn local_non_upstream_405_is_not_affected_by_http_overrides() {
+        let forwarder = test_forwarder(Duration::ZERO, Duration::ZERO);
+        let provider = test_provider_with_http_overrides([(405, HttpFailoverAction::Failover)]);
+
+        assert_eq!(
+            forwarder.categorize_proxy_error(
+                &ProxyError::InvalidRequest("local router returned HTTP 405".to_string()),
+                &provider,
+            ),
+            ErrorCategory::NonRetryable
+        );
+    }
+
+    #[test]
     fn official_codex_failures_are_not_retryable() {
         let forwarder = test_forwarder(Duration::ZERO, Duration::ZERO);
-        let mut provider = test_provider_with_type(None);
+        let mut provider = test_provider_with_http_overrides([
+            (400, HttpFailoverAction::Failover),
+            (429, HttpFailoverAction::Failover),
+        ]);
         provider.id = "codex-official".to_string();
         provider.category = Some("official".to_string());
 
@@ -4515,6 +4826,51 @@ mod tests {
                 ErrorCategory::NonRetryable
             );
         }
+    }
+
+    #[tokio::test]
+    async fn rectifier_retry_failure_uses_override_without_changing_inherited_default() {
+        let forwarder = test_forwarder(Duration::ZERO, Duration::ZERO);
+        let forced = test_provider_with_http_overrides([(400, HttpFailoverAction::Failover)]);
+        let inherited = test_provider_with_type(None);
+        let mut last_error = None;
+        let mut last_provider = None;
+
+        let forced_result = forwarder
+            .handle_rectifier_retry_failure(
+                ProxyError::UpstreamError {
+                    status: 400,
+                    body: None,
+                },
+                &forced,
+                "claude",
+                false,
+                "test",
+                &mut last_error,
+                &mut last_provider,
+            )
+            .await;
+        assert!(forced_result.is_none());
+        assert_eq!(
+            last_provider.as_ref().map(|provider| provider.id.as_str()),
+            Some("provider-1")
+        );
+
+        let inherited_result = forwarder
+            .handle_rectifier_retry_failure(
+                ProxyError::UpstreamError {
+                    status: 429,
+                    body: None,
+                },
+                &inherited,
+                "claude",
+                false,
+                "test",
+                &mut last_error,
+                &mut last_provider,
+            )
+            .await;
+        assert!(inherited_result.is_some());
     }
 
     #[test]
