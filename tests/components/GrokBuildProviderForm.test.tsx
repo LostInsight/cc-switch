@@ -191,6 +191,12 @@ context_window = 250000
           name: "Existing Relay",
           settingsConfig: { config },
           meta: {
+            failoverPolicy: {
+              httpStatusOverrides: {
+                "405": "failover",
+                "429": "stop",
+              },
+            },
             custom_endpoints: {
               "https://deleted.example.com/v1": {
                 url: "https://deleted.example.com/v1",
@@ -214,6 +220,12 @@ context_window = 250000
 
     expect(onSubmit).toHaveBeenCalledTimes(1);
     expect(onSubmit.mock.calls[0][0].meta.custom_endpoints).toBeUndefined();
+    expect(onSubmit.mock.calls[0][0].meta.failoverPolicy).toEqual({
+      httpStatusOverrides: {
+        "405": "failover",
+        "429": "stop",
+      },
+    });
   });
 
   // #6427 复用 Codex 表单时把 Codex 专属文案原样带进了 Grok Build 表单。

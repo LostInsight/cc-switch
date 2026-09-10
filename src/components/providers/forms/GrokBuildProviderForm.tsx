@@ -53,9 +53,12 @@ import {
 import { resolveProviderIcon } from "@/utils/providerIcon";
 import { GROKBUILD_OFFICIAL_PROVIDER_ID } from "@/utils/providerCapabilities";
 import {
+  ProviderFailoverPolicySection,
   ProviderProxyConfigSection,
   isValidProviderProxyUrl,
+  normalizeProviderFailoverPolicy,
   normalizeProviderProxyConfig,
+  providerFailoverPolicyForSave,
   providerProxyConfigForSave,
 } from "./ProviderAdvancedConfig";
 
@@ -165,6 +168,9 @@ export function GrokBuildProviderForm({
   const [providerProxyConfig, setProviderProxyConfig] = useState(() =>
     normalizeProviderProxyConfig(initialData?.meta?.proxyConfig),
   );
+  const [httpStatusOverrides, setHttpStatusOverrides] = useState(() =>
+    normalizeProviderFailoverPolicy(initialData?.meta?.failoverPolicy),
+  );
 
   const form = useForm<ProviderFormData>({
     resolver: zodResolver(providerSchema),
@@ -193,6 +199,9 @@ export function GrokBuildProviderForm({
   useEffect(() => {
     setProviderProxyConfig(
       normalizeProviderProxyConfig(initialData?.meta?.proxyConfig),
+    );
+    setHttpStatusOverrides(
+      normalizeProviderFailoverPolicy(initialData?.meta?.failoverPolicy),
     );
   }, [initialData]);
 
@@ -426,6 +435,7 @@ export function GrokBuildProviderForm({
       customUserAgent: customUserAgent.trim() || undefined,
       localProxyRequestOverrides: requestOverrides.overrides,
       proxyConfig: providerProxyConfigForSave(providerProxyConfig),
+      failoverPolicy: providerFailoverPolicyForSave(httpStatusOverrides),
       maxOutputTokens:
         Number.isInteger(parsedMaxOutputTokens) && parsedMaxOutputTokens > 0
           ? parsedMaxOutputTokens
@@ -577,6 +587,13 @@ export function GrokBuildProviderForm({
           value={providerProxyConfig}
           onChange={setProviderProxyConfig}
         />
+
+        {category !== "official" && (
+          <ProviderFailoverPolicySection
+            value={httpStatusOverrides}
+            onChange={setHttpStatusOverrides}
+          />
+        )}
 
         <FormField
           control={form.control}

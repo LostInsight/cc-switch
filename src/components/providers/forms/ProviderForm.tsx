@@ -95,9 +95,12 @@ import { OmoFormFields } from "./OmoFormFields";
 import { parseOmoOtherFieldsObject } from "@/types/omo";
 import {
   ProviderAdvancedConfig,
+  ProviderFailoverPolicySection,
   ProviderProxyConfigSection,
   isValidProviderProxyUrl,
+  normalizeProviderFailoverPolicy,
   normalizeProviderProxyConfig,
+  providerFailoverPolicyForSave,
   providerProxyConfigForSave,
   type PricingModelSourceOption,
 } from "./ProviderAdvancedConfig";
@@ -390,6 +393,9 @@ function ProviderFormFull({
   const [providerProxyConfig, setProviderProxyConfig] = useState(() =>
     normalizeProviderProxyConfig(initialData?.meta?.proxyConfig),
   );
+  const [httpStatusOverrides, setHttpStatusOverrides] = useState(() =>
+    normalizeProviderFailoverPolicy(initialData?.meta?.failoverPolicy),
+  );
 
   const { category } = useProviderCategory({
     appId,
@@ -425,6 +431,9 @@ function ProviderFormFull({
     });
     setProviderProxyConfig(
       normalizeProviderProxyConfig(initialData?.meta?.proxyConfig),
+    );
+    setHttpStatusOverrides(
+      normalizeProviderFailoverPolicy(initialData?.meta?.failoverPolicy),
     );
     setSelectedGitHubAccountId(
       resolveManagedAccountId(initialData?.meta, "github_copilot"),
@@ -1841,6 +1850,10 @@ function ProviderFormFull({
         ? overridesResult.overrides
         : undefined,
       proxyConfig: providerProxyConfigForSave(providerProxyConfig),
+      failoverPolicy:
+        category !== "official"
+          ? providerFailoverPolicyForSave(httpStatusOverrides)
+          : baseMeta?.failoverPolicy,
       costMultiplier: pricingConfig.enabled
         ? pricingConfig.costMultiplier
         : undefined,
@@ -2861,6 +2874,13 @@ function ProviderFormFull({
             value={providerProxyConfig}
             onChange={setProviderProxyConfig}
           />
+
+          {category !== "official" && (
+            <ProviderFailoverPolicySection
+              value={httpStatusOverrides}
+              onChange={setHttpStatusOverrides}
+            />
+          )}
 
           {!isAnyOmoCategory &&
             appId !== "opencode" &&
