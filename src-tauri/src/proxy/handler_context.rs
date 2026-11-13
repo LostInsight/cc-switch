@@ -129,19 +129,22 @@ impl RequestContext {
             session_result.client_provided
         );
 
-        // 使用共享的 ProviderRouter 选择 Provider（熔断器状态跨请求保持）
-        // 注意：只在这里调用一次，结果传递给 forwarder，避免重复消耗 HalfOpen 名额
-        let providers = state
-            .provider_router
-            .select_providers(app_type_str)
-            .await
-            .map_err(|e| match e {
-                crate::error::AppError::AllProvidersCircuitOpen => {
-                    ProxyError::AllProvidersCircuitOpen
-                }
-                crate::error::AppError::NoProvidersConfigured => ProxyError::NoProvidersConfigured,
-                _ => ProxyError::DatabaseError(e.to_string()),
-            })?;
+        // 使用共享的 ProviderRouter 选择 Provider（熔断器状态跨请求保持）。
+        // 持续重试模式下，所有供应商都处于 Open 只是“暂时不可用”，因此在这里
+        // 等待最近的 HalfOpen 窗口；真正的配置错误仍立即返回。
+        let provider_result = if app_config.retry_until_success {
+            state
+                .provider_router
+                .wait_for_available_providers(app_type_str)
+                .await
+        } else {
+            state.provider_router.select_providers(app_type_str).await
+        };
+        let providers = provider_result.map_err(|e| match e {
+            crate::error::AppError::AllProvidersCircuitOpen => ProxyError::AllProvidersCircuitOpen,
+            crate::error::AppError::NoProvidersConfigured => ProxyError::NoProvidersConfigured,
+            _ => ProxyError::DatabaseError(e.to_string()),
+        })?;
 
         let provider = providers
             .first()
@@ -216,12 +219,10 @@ impl RequestContext {
                 (0, 0, 0)
             };
 
-        // 故障转移关闭时强制 max_retries=0（仅尝试 1 个 provider），与「不超时 + 不切换」语义一致。
-        let max_retries = if self.app_config.auto_failover_enabled {
-            self.app_config.max_retries
-        } else {
-            0
-        };
+        // max_retries 表示失败后的继续尝试次数，与是否开启跨 Provider 故障转移独立。
+        // 故障转移关闭时 providers 只有当前 Provider；Retryable 错误会按该次数重试同一家，
+        // NonRetryable 错误则立即透传。超时策略仍保持原有语义：关闭故障转移时不启用超时。
+        let max_retries = self.app_config.max_retries;
 
         RequestForwarder::new(
             state.provider_router.clone(),
@@ -241,6 +242,8 @@ impl RequestContext {
             self.optimizer_config.clone(),
             self.copilot_optimizer_config.clone(),
             max_retries,
+            self.app_config.retry_until_success,
+            self.app_config.auto_failover_enabled,
         )
     }
 
@@ -300,7 +303,97 @@ pub(crate) fn extract_gemini_model_from_path(endpoint: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::extract_gemini_model_from_path;
+    use super::{extract_gemini_model_from_path, RequestContext};
+    use crate::app_config::AppType;
+    use crate::database::Database;
+    use crate::provider::Provider;
+    use crate::proxy::failover_switch::FailoverSwitchManager;
+    use crate::proxy::provider_router::ProviderRouter;
+    use crate::proxy::providers::{
+        codex_chat_history::CodexChatHistoryStore, gemini_shadow::GeminiShadowStore,
+    };
+    use crate::proxy::server::ProxyState;
+    use crate::proxy::types::{ProxyConfig, ProxyStatus};
+    use serde_json::json;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use tokio::sync::RwLock;
+
+    #[tokio::test]
+    async fn request_context_waits_for_half_open_when_continuous_retry_is_enabled() {
+        let db = Arc::new(Database::memory().expect("memory db"));
+        let provider = Provider::with_id(
+            "codex-recovery".to_string(),
+            "Codex Recovery".to_string(),
+            json!({}),
+            None,
+        );
+        db.save_provider("codex", &provider).expect("save provider");
+        db.add_to_failover_queue("codex", &provider.id)
+            .expect("add failover provider");
+
+        let mut config = db
+            .get_proxy_config_for_app("codex")
+            .await
+            .expect("load config");
+        config.auto_failover_enabled = true;
+        config.retry_until_success = true;
+        config.circuit_failure_threshold = 1;
+        config.circuit_timeout_seconds = 1;
+        db.update_proxy_config_for_app(config)
+            .await
+            .expect("save config");
+
+        let provider_router = Arc::new(ProviderRouter::new(db.clone()));
+        provider_router
+            .record_result(
+                &provider.id,
+                "codex",
+                None,
+                false,
+                Some("temporary failure".to_string()),
+            )
+            .await
+            .expect("open circuit");
+        assert!(matches!(
+            provider_router.select_providers("codex").await,
+            Err(crate::error::AppError::AllProvidersCircuitOpen)
+        ));
+
+        let state = ProxyState {
+            db: db.clone(),
+            config: Arc::new(RwLock::new(ProxyConfig::default())),
+            status: Arc::new(RwLock::new(ProxyStatus::default())),
+            start_time: Arc::new(RwLock::new(None)),
+            current_providers: Arc::new(RwLock::new(HashMap::new())),
+            provider_router,
+            gemini_shadow: Arc::new(GeminiShadowStore::default()),
+            codex_chat_history: Arc::new(CodexChatHistoryStore::default()),
+            app_handle: None,
+            failover_manager: Arc::new(FailoverSwitchManager::new(db)),
+        };
+
+        let started = Instant::now();
+        let context = tokio::time::timeout(
+            Duration::from_secs(3),
+            RequestContext::new(
+                &state,
+                &json!({ "model": "gpt-test" }),
+                &axum::http::HeaderMap::new(),
+                AppType::Codex,
+                "Codex",
+                "codex",
+            ),
+        )
+        .await
+        .expect("request context should wait and resume after HalfOpen")
+        .expect("request context should not return 503");
+
+        assert!(started.elapsed() >= Duration::from_millis(900));
+        assert_eq!(context.provider.id, provider.id);
+        assert!(context.app_config.retry_until_success);
+    }
 
     #[test]
     fn extract_model_with_action() {

@@ -498,6 +498,64 @@ describe("ProviderForm Codex Official managed account", () => {
     );
   });
 
+  it("refreshes Codex model mapping when editing a different provider in the same form", async () => {
+    const queryClient = createTestQueryClient();
+    const onSubmit = vi.fn();
+    const renderForm = (
+      name: string,
+      sourceModel: string,
+      targetModel: string,
+    ) => (
+      <QueryClientProvider client={queryClient}>
+        <ProviderForm
+          appId="codex"
+          providerId={name}
+          submitLabel="save-provider"
+          onSubmit={onSubmit}
+          onCancel={vi.fn()}
+          initialData={{
+            name,
+            category: "third_party",
+            settingsConfig: {
+              auth: { OPENAI_API_KEY: "test-key" },
+              config:
+                'model_provider = "custom"\n[model_providers.custom]\nbase_url = "https://example.com/v1"\nwire_api = "responses"',
+            },
+            meta: {
+              apiFormat: "openai_responses",
+              codexModelMapping: {
+                enabled: true,
+                modelMap: { [sourceModel]: targetModel },
+                effortMap: {},
+              },
+            },
+          }}
+        />
+      </QueryClientProvider>
+    );
+
+    const { rerender } = render(
+      renderForm("provider-a", "gpt-5.6-terra", "gpt-5.6-sol"),
+    );
+    expect(screen.getByLabelText("显示模型")).toHaveValue("gpt-5.6-terra");
+    expect(screen.getByLabelText("实际模型")).toHaveValue("gpt-5.6-sol");
+
+    rerender(renderForm("provider-b", "gpt-5.6-sol", "gpt-6-astra"));
+
+    await waitFor(() =>
+      expect(screen.getByLabelText("显示模型")).toHaveValue("gpt-5.6-sol"),
+    );
+    expect(screen.getByLabelText("实际模型")).toHaveValue("gpt-6-astra");
+
+    fireEvent.click(screen.getByRole("button", { name: "save-provider" }));
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1));
+    expect(onSubmit.mock.calls[0][0].meta?.codexModelMapping).toEqual({
+      enabled: true,
+      modelMap: { "gpt-5.6-sol": "gpt-6-astra" },
+      effortMap: {},
+    });
+  });
+
   it("blocks saving a managed account that requires reauthentication", async () => {
     authState.codexReauthRequired = true;
     const onSubmit = vi.fn();

@@ -168,6 +168,9 @@ pub struct AppProxyConfig {
     pub auto_failover_enabled: bool,
     /// 最大重试次数
     pub max_retries: u32,
+    /// 是否持续重试 Retryable 错误，直到成功或客户端取消
+    #[serde(default)]
+    pub retry_until_success: bool,
     /// 流式首字超时（秒）
     pub streaming_first_byte_timeout: u32,
     /// 流式静默超时（秒）

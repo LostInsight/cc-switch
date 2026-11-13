@@ -130,6 +130,7 @@ export interface AppProxyConfig {
   enabled: boolean;
   autoFailoverEnabled: boolean;
   maxRetries: number;
+  retryUntilSuccess: boolean;
   streamingFirstByteTimeout: number;
   streamingIdleTimeout: number;
   nonStreamingTimeout: number;

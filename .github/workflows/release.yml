@@ -583,6 +583,18 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Checkout release notes
+        uses: actions/checkout@v6
+
+      - name: Select version release notes
+        id: release-notes
+        shell: bash
+        run: |
+          notes_path="docs/releases/${GITHUB_REF_NAME}.md"
+          if [ -f "$notes_path" ]; then
+            echo "path=$notes_path" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Download built release artifacts
         uses: actions/download-artifact@v8
         with:
@@ -601,7 +613,8 @@ jobs:
         with:
           tag_name: ${{ github.ref_name }}
           name: CC Switch ${{ github.ref_name }}
-          prerelease: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          body_path: ${{ steps.release-notes.outputs.path }}
           body: |
             ## CC Switch ${{ github.ref_name }}
 

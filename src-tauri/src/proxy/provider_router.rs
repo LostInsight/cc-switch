@@ -6,10 +6,13 @@ use crate::app_config::AppType;
 use crate::database::Database;
 use crate::error::AppError;
 use crate::provider::Provider;
-use crate::proxy::circuit_breaker::{AllowResult, CircuitBreaker, CircuitBreakerConfig};
+use crate::proxy::circuit_breaker::{
+    AllowResult, CircuitBreaker, CircuitBreakerConfig, HalfOpenPermit,
+};
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
 
 /// Codex Official requests carry the selected account's native Authorization
@@ -130,14 +133,69 @@ impl ProviderRouter {
         Ok(result)
     }
 
+    /// 返回当前应用最早可重新探测 Open 熔断器的等待时间。
+    ///
+    /// 仅用于持续重试模式。若当前没有 Open 熔断器，返回一个很短的退避时间，
+    /// 避免 HalfOpen 探测名额被并发请求占用时形成忙循环。
+    pub async fn next_circuit_retry_delay(&self, app_type: &str) -> Duration {
+        let prefix = format!("{app_type}:");
+        let breakers: Vec<Arc<CircuitBreaker>> = {
+            let breakers = self.circuit_breakers.read().await;
+            breakers
+                .iter()
+                .filter(|(key, _)| key.starts_with(&prefix))
+                .map(|(_, breaker)| breaker.clone())
+                .collect()
+        };
+
+        let mut shortest: Option<Duration> = None;
+        for breaker in breakers {
+            if let Some(delay) = breaker.retry_after().await {
+                shortest = Some(match shortest {
+                    Some(current) => current.min(delay),
+                    None => delay,
+                });
+            }
+        }
+
+        // timeout=0 以及 HalfOpen permit 被占用时都至少让出一次调度周期。
+        shortest
+            .unwrap_or_else(|| Duration::from_millis(100))
+            .max(Duration::from_millis(25))
+    }
+
+    /// 持续等待，直到至少有一个 Provider 可进入请求阶段。
+    ///
+    /// 只吞掉 AllProvidersCircuitOpen；真正的配置错误（例如没有配置 Provider）
+    /// 仍立即返回，避免“无限等待”掩盖不可恢复的配置问题。
+    pub async fn wait_for_available_providers(
+        &self,
+        app_type: &str,
+    ) -> Result<Vec<Provider>, AppError> {
+        loop {
+            match self.select_providers(app_type).await {
+                Ok(providers) => return Ok(providers),
+                Err(AppError::AllProvidersCircuitOpen) => {
+                    let delay = self.next_circuit_retry_delay(app_type).await;
+                    log::info!(
+                        "[{app_type}] 所有供应商已熔断，持续重试模式等待 {:?} 后重新探测",
+                        delay
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     /// 请求执行前获取熔断器“放行许可”
     ///
     /// - Closed：直接放行
     /// - Open：超时到达后切到 HalfOpen 并放行一次探测
     /// - HalfOpen：按限流规则放行探测
     ///
-    /// 注意：调用方必须在请求结束后通过 `record_result()` 释放 HalfOpen 名额，
-    /// 否则会导致该 Provider 长时间无法进入探测状态。
+    /// HalfOpen permit 由返回值持有；请求正常结束时交给 `record_result()`，
+    /// future 被取消时也会自动释放。
     pub async fn allow_provider_request(&self, provider_id: &str, app_type: &str) -> AllowResult {
         let circuit_key = format!("{app_type}:{provider_id}");
         let breaker = self.get_or_create_circuit_breaker(&circuit_key).await;
@@ -149,7 +207,7 @@ impl ProviderRouter {
         &self,
         provider_id: &str,
         app_type: &str,
-        used_half_open_permit: bool,
+        half_open_permit: Option<HalfOpenPermit>,
         success: bool,
         error_msg: Option<String>,
     ) -> Result<(), AppError> {
@@ -164,9 +222,9 @@ impl ProviderRouter {
         let breaker = self.get_or_create_circuit_breaker(&circuit_key).await;
 
         if success {
-            breaker.record_success(used_half_open_permit).await;
+            breaker.record_success(half_open_permit).await;
         } else {
-            breaker.record_failure(used_half_open_permit).await;
+            breaker.record_failure(half_open_permit).await;
         }
 
         // 3. 更新数据库健康状态（使用配置的阈值）
@@ -203,16 +261,11 @@ impl ProviderRouter {
     /// 但仍需释放占用的探测名额，避免 HalfOpen 状态卡死
     pub async fn release_permit_neutral(
         &self,
-        provider_id: &str,
-        app_type: &str,
-        used_half_open_permit: bool,
+        _provider_id: &str,
+        _app_type: &str,
+        half_open_permit: Option<HalfOpenPermit>,
     ) {
-        if !used_half_open_permit {
-            return;
-        }
-        let circuit_key = format!("{app_type}:{provider_id}");
-        let breaker = self.get_or_create_circuit_breaker(&circuit_key).await;
-        breaker.release_half_open_permit();
+        drop(half_open_permit);
     }
 
     /// 更新所有熔断器的配置（热更新）
@@ -572,7 +625,7 @@ mod tests {
         let router = ProviderRouter::new(db.clone());
 
         router
-            .record_result("b", "claude", false, false, Some("fail".to_string()))
+            .record_result("b", "claude", None, false, Some("fail".to_string()))
             .await
             .unwrap();
 
@@ -580,6 +633,58 @@ mod tests {
         assert_eq!(providers.len(), 2);
 
         assert!(router.allow_provider_request("b", "claude").await.allowed);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn continuous_wait_recovers_when_all_providers_are_circuit_open() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+        let provider =
+            Provider::with_id("a".to_string(), "Provider A".to_string(), json!({}), None);
+        db.save_provider("claude", &provider).unwrap();
+        db.add_to_failover_queue("claude", &provider.id).unwrap();
+
+        let mut config = db.get_proxy_config_for_app("claude").await.unwrap();
+        config.auto_failover_enabled = true;
+        config.retry_until_success = true;
+        config.circuit_failure_threshold = 1;
+        config.circuit_timeout_seconds = 1;
+        db.update_proxy_config_for_app(config).await.unwrap();
+        assert!(
+            db.get_proxy_config_for_app("claude")
+                .await
+                .unwrap()
+                .retry_until_success,
+            "retry_until_success must round-trip through proxy_config"
+        );
+
+        let router = ProviderRouter::new(db);
+        router
+            .record_result(
+                &provider.id,
+                "claude",
+                None,
+                false,
+                Some("temporary failure".to_string()),
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            router.select_providers("claude").await,
+            Err(AppError::AllProvidersCircuitOpen)
+        ));
+
+        let providers = tokio::time::timeout(
+            Duration::from_secs(3),
+            router.wait_for_available_providers("claude"),
+        )
+        .await
+        .expect("wait should reach HalfOpen")
+        .expect("provider should become selectable");
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].id, provider.id);
     }
 
     #[tokio::test]
@@ -611,14 +716,14 @@ mod tests {
 
         // 触发熔断：1 次失败
         router
-            .record_result("a", "claude", false, false, Some("fail".to_string()))
+            .record_result("a", "claude", None, false, Some("fail".to_string()))
             .await
             .unwrap();
 
         // 第一次请求：获取 HalfOpen 探测名额
         let first = router.allow_provider_request("a", "claude").await;
         assert!(first.allowed);
-        assert!(first.used_half_open_permit);
+        assert!(first.half_open_permit.is_some());
 
         // 第二次请求应被拒绝（名额已被占用）
         let second = router.allow_provider_request("a", "claude").await;
@@ -626,12 +731,12 @@ mod tests {
 
         // 使用 release_permit_neutral 释放名额（不影响健康统计）
         router
-            .release_permit_neutral("a", "claude", first.used_half_open_permit)
+            .release_permit_neutral("a", "claude", first.half_open_permit)
             .await;
 
         // 第三次请求应被允许（名额已释放）
         let third = router.allow_provider_request("a", "claude").await;
         assert!(third.allowed);
-        assert!(third.used_half_open_permit);
+        assert!(third.half_open_permit.is_some());
     }
 }

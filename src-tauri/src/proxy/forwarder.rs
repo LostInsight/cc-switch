@@ -5,12 +5,13 @@
 use super::hyper_client::{ProxyResponse, MAX_RESPONSE_BODY_BYTES};
 use super::{
     body_filter::filter_private_params_with_whitelist,
+    circuit_breaker::HalfOpenPermit,
     content_encoding::{decompress_body_with_limit, get_content_encoding},
     error::*,
     failover_switch::FailoverSwitchManager,
     json_canonical::{canonicalize_value, short_value_hash},
     log_codes::fwd as log_fwd,
-    provider_router::ProviderRouter,
+    provider_router::{provider_supports_failover, ProviderRouter},
     providers::{
         codex_chat_history::CodexChatHistoryStore, gemini_shadow::GeminiShadowStore, get_adapter,
         AuthInfo, AuthStrategy, ProviderAdapter, ProviderType,
@@ -34,6 +35,7 @@ use futures::StreamExt;
 use http::Extensions;
 use serde_json::Value;
 use std::sync::Arc;
+use std::time::Duration;
 use tauri::Manager;
 use tokio::sync::RwLock;
 
@@ -115,6 +117,37 @@ pub struct ForwardResult {
 pub struct ForwardError {
     pub error: ProxyError,
     pub provider: Option<Provider>,
+    /// Best-effort model identity after request-level routing/mapping.
+    /// Failed requests do not produce `ForwardResult`, so carry this separately
+    /// from the source model retained by `RequestContext`.
+    pub outbound_model: Option<String>,
+}
+
+fn continuous_retry_backoff(round: u32) -> Duration {
+    let exponent = round.saturating_sub(1).min(4);
+    let millis = 500u64.saturating_mul(1u64 << exponent).min(5_000);
+    Duration::from_millis(millis)
+}
+
+fn routed_outbound_model_hint(
+    app_type: &AppType,
+    body: &Value,
+    provider: &Provider,
+) -> Option<String> {
+    let mapped = if matches!(app_type, AppType::ClaudeDesktop) {
+        crate::claude_desktop_config::map_proxy_request_model(body.clone(), provider).ok()?
+    } else if matches!(app_type, AppType::Codex) {
+        super::codex_model_mapper::apply(body.clone(), provider)
+    } else {
+        super::model_mapper::apply_model_mapping(body.clone(), provider).0
+    };
+
+    mapped
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(ToString::to_string)
 }
 
 /// 活跃连接 RAII guard
@@ -182,12 +215,16 @@ pub struct RequestForwarder {
     non_streaming_timeout: std::time::Duration,
     /// 流式请求响应头等待超时（秒）
     streaming_first_byte_timeout: std::time::Duration,
-    /// 单个客户端请求最多尝试的 provider 数。
+    /// 单个客户端请求最多允许的上游尝试次数。
     ///
-    /// 由 `AppProxyConfig.max_retries` (UI: "请求失败时的重试次数, 0-10") 派生：
-    /// `max_attempts = max_retries + 1`，所以 max_retries=0 表示仅尝试一家、
-    /// max_retries=3（默认）表示最多 4 家。loop 同时受 providers.len() 自然限制。
+    /// 由 `AppProxyConfig.max_retries` (UI: "Retryable 错误的继续尝试次数, 0-10") 派生：
+    /// `max_attempts = max_retries + 1`。多 Provider 故障转移时同时受 providers.len()
+    /// 限制；单 Provider 模式则在 Retryable 错误时重复尝试当前 Provider。
     max_attempts: usize,
+    /// Retryable 错误是否持续尝试，直到成功或客户端取消。
+    retry_until_success: bool,
+    /// 是否启用跨 Provider 故障转移；也决定第三方 Provider 是否遵守熔断器。
+    auto_failover_enabled: bool,
 }
 
 impl RequestForwarder {
@@ -236,6 +273,33 @@ impl RequestForwarder {
             && super::media_sanitizer::is_unsupported_image_error(error)
     }
 
+    /// Codex Responses can replay opaque reasoning ciphertext produced by a
+    /// different upstream/account. That ciphertext is intentionally not portable:
+    /// gateways reject it with `invalid_encrypted_content` even though the visible
+    /// conversation, tool calls and tool outputs are otherwise reusable.
+    ///
+    /// Treat this as a one-shot request rectification, not as a provider-health
+    /// failure: drop only stale top-level reasoning items that actually carry
+    /// `encrypted_content`, then retry the same provider once. `include` remains
+    /// untouched so a successful upstream can emit fresh ciphertext for later turns.
+    fn codex_encrypted_content_retry_body(
+        &self,
+        app_type: &AppType,
+        provider_body: &Value,
+        error: &ProxyError,
+    ) -> Option<(Value, usize)> {
+        if !matches!(app_type, AppType::Codex)
+            || !self.rectifier_config.enabled
+            || !is_invalid_encrypted_content_error(error)
+        {
+            return None;
+        }
+
+        let mut retry_body = provider_body.clone();
+        let removed = remove_stale_codex_encrypted_reasoning_items(&mut retry_body);
+        (removed > 0).then_some((retry_body, removed))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         router: Arc<ProviderRouter>,
@@ -255,6 +319,8 @@ impl RequestForwarder {
         optimizer_config: OptimizerConfig,
         copilot_optimizer_config: CopilotOptimizerConfig,
         max_retries: u32,
+        retry_until_success: bool,
+        auto_failover_enabled: bool,
     ) -> Self {
         // max_retries 是「失败后重试次数」语义，attempt 上限 = retries + 1。
         // saturating_add 防止 u32::MAX + 1 溢出。
@@ -278,6 +344,8 @@ impl RequestForwarder {
                 streaming_first_byte_timeout,
             ),
             max_attempts,
+            retry_until_success,
+            auto_failover_enabled,
         }
     }
 
@@ -285,12 +353,12 @@ impl RequestForwarder {
         &self,
         provider_id: &str,
         app_type: &str,
-        used_half_open_permit: bool,
+        half_open_permit: Option<HalfOpenPermit>,
     ) {
-        if used_half_open_permit {
+        if half_open_permit.is_some() {
             if let Err(e) = self
                 .router
-                .record_result(provider_id, app_type, true, true, None)
+                .record_result(provider_id, app_type, half_open_permit, true, None)
                 .await
             {
                 log::warn!(
@@ -305,7 +373,7 @@ impl RequestForwarder {
         let app_type = app_type.to_string();
         tokio::spawn(async move {
             if let Err(e) = router
-                .record_result(&provider_id, &app_type, false, true, None)
+                .record_result(&provider_id, &app_type, None, true, None)
                 .await
             {
                 log::warn!(
@@ -327,28 +395,16 @@ impl RequestForwarder {
         retry_err: ProxyError,
         provider: &Provider,
         app_type_str: &str,
-        used_half_open_permit: bool,
+        half_open_permit: &mut Option<HalfOpenPermit>,
         rectifier_label: &str,
+        outbound_model: Option<&str>,
         last_error: &mut Option<ProxyError>,
         last_provider: &mut Option<Provider>,
     ) -> Option<ForwardError> {
-        // Provider 错误：本家上游/网络确实出问题，下一家 provider 可能可用 → 继续故障转移。
-        // 客户端错误：整流后请求仍违法，下一家也修不好 → 直接返回。
-        let is_provider_error = match &retry_err {
-            ProxyError::Timeout(_) | ProxyError::ForwardFailed(_) => true,
-            ProxyError::UpstreamError { status, .. } => {
-                self.categorize_upstream_http_error(
-                    provider,
-                    *status,
-                    if *status >= 500 {
-                        ErrorCategory::Retryable
-                    } else {
-                        ErrorCategory::NonRetryable
-                    },
-                ) == ErrorCategory::Retryable
-            }
-            _ => false,
-        };
+        // 整流后的请求已经是本次 Provider 的真实上游结果，必须与正常请求
+        // 走同一个分类器，包含 Provider override 与 Official Codex 保护。
+        let is_provider_error =
+            self.categorize_proxy_error(&retry_err, provider) == ErrorCategory::Retryable;
 
         if is_provider_error {
             let _ = self
@@ -356,7 +412,7 @@ impl RequestForwarder {
                 .record_result(
                     &provider.id,
                     app_type_str,
-                    used_half_open_permit,
+                    half_open_permit.take(),
                     false,
                     Some(retry_err.to_string()),
                 )
@@ -374,7 +430,7 @@ impl RequestForwarder {
         }
 
         self.router
-            .release_permit_neutral(&provider.id, app_type_str, used_half_open_permit)
+            .release_permit_neutral(&provider.id, app_type_str, half_open_permit.take())
             .await;
         let mut status = self.status.write().await;
         status.failed_requests += 1;
@@ -386,7 +442,20 @@ impl RequestForwarder {
         Some(ForwardError {
             error: retry_err,
             provider: Some(provider.clone()),
+            outbound_model: outbound_model.map(ToString::to_string),
         })
+    }
+
+    fn should_retry_continuously(&self, error: &ForwardError) -> bool {
+        match &error.error {
+            ProxyError::NoAvailableProvider
+            | ProxyError::AllProvidersCircuitOpen
+            | ProxyError::MaxRetriesExceeded => true,
+            ProxyError::NoProvidersConfigured => false,
+            _ => error.provider.as_ref().is_some_and(|provider| {
+                self.categorize_proxy_error(&error.error, provider) == ErrorCategory::Retryable
+            }),
+        }
     }
 
     /// 转发请求（带故障转移）
@@ -412,18 +481,83 @@ impl RequestForwarder {
             s.total_requests = s.total_requests.saturating_add(1);
             s.last_request_at = Some(chrono::Utc::now().to_rfc3339());
         }
-        let result = self
-            .forward_with_retry_inner(
-                app_type, method, endpoint, body, headers, extensions, providers,
-            )
-            .await;
-        // 把 guard 注入到 Ok 结果，让它随响应一起流转到 response_processor，
-        // 在流式 body 的 future 内才真正 drop。
-        // Err 路径：guard 在函数 scope 内随返回值落地时自动 drop。
-        result.map(|mut fr| {
-            fr.connection_guard = Some(guard);
-            fr
-        })
+        let mut providers = providers;
+        let mut retry_round = 0u32;
+
+        loop {
+            let result = self
+                .forward_with_retry_inner(
+                    app_type,
+                    method.clone(),
+                    endpoint,
+                    body.clone(),
+                    headers.clone(),
+                    extensions.clone(),
+                    providers,
+                )
+                .await;
+
+            match result {
+                Ok(mut fr) => {
+                    // 把 guard 注入到 Ok 结果，让它随响应一起流转到 response_processor，
+                    // 在流式 body 的 future 内才真正 drop。
+                    fr.connection_guard = Some(guard);
+                    return Ok(fr);
+                }
+                Err(error)
+                    if self.retry_until_success && self.should_retry_continuously(&error) =>
+                {
+                    retry_round = retry_round.saturating_add(1);
+                    let app_type_str = app_type.as_str();
+
+                    match self.router.select_providers(app_type_str).await {
+                        Ok(next_providers) => {
+                            let delay = continuous_retry_backoff(retry_round);
+                            log::info!(
+                                "[{app_type_str}] Retryable 错误进入持续重试，第 {retry_round} 轮将在 {:?} 后继续",
+                                delay
+                            );
+                            tokio::time::sleep(delay).await;
+                            providers = next_providers;
+                        }
+                        Err(crate::error::AppError::AllProvidersCircuitOpen) => {
+                            providers = self
+                                .router
+                                .wait_for_available_providers(app_type_str)
+                                .await
+                                .map_err(|router_error| ForwardError {
+                                    error: match router_error {
+                                        crate::error::AppError::AllProvidersCircuitOpen => {
+                                            ProxyError::AllProvidersCircuitOpen
+                                        }
+                                        crate::error::AppError::NoProvidersConfigured => {
+                                            ProxyError::NoProvidersConfigured
+                                        }
+                                        other => ProxyError::DatabaseError(other.to_string()),
+                                    },
+                                    provider: error.provider.clone(),
+                                    outbound_model: error.outbound_model.clone(),
+                                })?;
+                        }
+                        Err(crate::error::AppError::NoProvidersConfigured) => {
+                            return Err(ForwardError {
+                                error: ProxyError::NoProvidersConfigured,
+                                provider: error.provider,
+                                outbound_model: error.outbound_model,
+                            });
+                        }
+                        Err(router_error) => {
+                            return Err(ForwardError {
+                                error: ProxyError::DatabaseError(router_error.to_string()),
+                                provider: error.provider,
+                                outbound_model: error.outbound_model,
+                            });
+                        }
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     /// 实际转发逻辑（不包含客户端维度的入口/出口计数）
@@ -453,6 +587,7 @@ impl RequestForwarder {
                 app_type.as_str()
             )),
             provider: None,
+            outbound_model: None,
         })?;
         let app_type_str = app_type.as_str();
 
@@ -460,27 +595,45 @@ impl RequestForwarder {
             return Err(ForwardError {
                 error: ProxyError::NoAvailableProvider,
                 provider: None,
+                outbound_model: None,
             });
         }
 
         let mut last_error = None;
         let mut last_provider = None;
+        let mut last_outbound_model = None;
         let mut attempted_providers = 0usize;
 
-        // 单 Provider 场景下跳过熔断器检查（故障转移关闭时）
-        let bypass_circuit_breaker = providers.len() == 1;
+        let repeat_single_provider = providers.len() == 1
+            && (!self.auto_failover_enabled
+                || !provider_supports_failover(app_type_str, &providers[0]));
+        let planned_attempts = if self.retry_until_success {
+            // 持续模式每一轮完整尝试当前可用 Provider；轮次之间重新选路。
+            providers.len()
+        } else if repeat_single_provider {
+            // 非故障转移单路由（以及 Codex Official 显式账号路由）按 max_retries
+            // 重复当前 Provider。
+            self.max_attempts
+        } else {
+            providers.len().min(self.max_attempts)
+        };
 
-        // 依次尝试每个供应商
-        for provider in providers.iter() {
+        // 依次尝试 Provider；仅真正的单路由模式重复使用同一个 Provider。
+        for attempt_index in 0..planned_attempts {
+            let provider = if repeat_single_provider {
+                &providers[0]
+            } else {
+                &providers[attempt_index]
+            };
             // 整流器重试标记：每个 provider 独立持有，避免标记跨 provider 短路故障转移
             // —— 首家 provider 整流后被 5xx/timeout 击落时，下家仍能用整流后的请求体走整流流程
             let mut rectifier_retried = false;
             let mut budget_rectifier_retried = false;
             let mut media_rectifier_retried = false;
 
-            // 上限检查：尊重用户在 AppProxyConfig.max_retries 上配置的「重试次数」。
-            // 放在熔断器 allow 检查之前，避免在已经超限时还占用 HalfOpen 探测名额。
-            if attempted_providers >= self.max_attempts {
+            // 有限模式尊重 max_retries；持续模式的上限由“客户端取消/成功”决定。
+            // 放在熔断器 allow 检查之前，避免已经超限时还占用 HalfOpen 探测名额。
+            if !self.retry_until_success && attempted_providers >= self.max_attempts {
                 log::warn!(
                     "[{app_type_str}] 已达最大尝试次数上限 ({}/{}), 停止故障转移",
                     attempted_providers,
@@ -489,16 +642,19 @@ impl RequestForwarder {
                 break;
             }
 
-            // 发起请求前先获取熔断器放行许可（HalfOpen 会占用探测名额）
-            // 单 Provider 场景下跳过此检查，避免熔断器阻塞所有请求
-            let (allowed, used_half_open_permit) = if bypass_circuit_breaker {
-                (true, false)
-            } else {
+            // 发起请求前获取熔断器放行许可（HalfOpen 会占用探测名额）。
+            // 只有真正启用跨 Provider 故障转移时才应用熔断器；Codex Official
+            // 显式账号选择仍保持单路由语义，不参与故障转移熔断。
+            let use_circuit_breaker =
+                self.auto_failover_enabled && provider_supports_failover(app_type_str, provider);
+            let (allowed, mut half_open_permit) = if use_circuit_breaker {
                 let permit = self
                     .router
                     .allow_provider_request(&provider.id, app_type_str)
                     .await;
-                (permit.allowed, permit.used_half_open_permit)
+                (permit.allowed, permit.half_open_permit)
+            } else {
+                (true, None)
             };
 
             if !allowed {
@@ -522,6 +678,9 @@ impl RequestForwarder {
                 };
 
             attempted_providers += 1;
+            let attempt_outbound_model =
+                routed_outbound_model_hint(app_type, &provider_body, provider);
+            last_outbound_model = attempt_outbound_model.clone();
 
             // 更新状态中的当前 Provider 信息（per-attempt 维度的标识）
             //
@@ -534,7 +693,8 @@ impl RequestForwarder {
                 status.current_provider_id = Some(provider.id.clone());
             }
 
-            // 转发请求（每个 Provider 只尝试一次，重试由客户端控制）
+            // 转发请求。多 Provider 模式每家至多一次；单 Provider 模式会在
+            // Retryable 错误后按 max_retries 再次进入本循环。
             match self
                 .forward(
                     app_type,
@@ -551,7 +711,7 @@ impl RequestForwarder {
                 Ok((response, claude_api_format, outbound_model)) => {
                     // 成功：普通闭合熔断状态异步记录，避免阻塞流式首包返回；
                     // HalfOpen 探测仍同步等待，保证 permit 与熔断状态及时释放。
-                    self.record_success_result(&provider.id, app_type_str, used_half_open_permit)
+                    self.record_success_result(&provider.id, app_type_str, half_open_permit.take())
                         .await;
 
                     // 更新当前应用类型使用的 provider
@@ -601,6 +761,114 @@ impl RequestForwarder {
                     });
                 }
                 Err(e) => {
+                    // Codex Responses 的 opaque reasoning ciphertext 只对生成它的
+                    // 上游/账号有效。跨 Provider 或跨账号继续旧会话时，上游可能返回
+                    // invalid_encrypted_content。先只移除这些旧 reasoning item，保留
+                    // message / function_call / function_call_output 等可移植上下文，随后
+                    // 对同一 Provider 重试一次；初次错误不计入 Provider 健康度。
+                    if let Some((retry_body, removed_reasoning_items)) =
+                        self.codex_encrypted_content_retry_body(app_type, &provider_body, &e)
+                    {
+                        log::warn!(
+                            "[{app_type_str}] [EncryptedContent] Upstream rejected stale reasoning ciphertext; retrying provider={} after removing {} encrypted reasoning item(s)",
+                            provider.id,
+                            removed_reasoning_items
+                        );
+
+                        match self
+                            .forward(
+                                app_type,
+                                &method,
+                                provider,
+                                endpoint,
+                                &retry_body,
+                                &headers,
+                                &extensions,
+                                adapter.as_ref(),
+                            )
+                            .await
+                        {
+                            Ok((response, claude_api_format, outbound_model)) => {
+                                log::info!(
+                                    "[{app_type_str}] [EncryptedContent] Recovery retry succeeded for provider={} after removing {} encrypted reasoning item(s)",
+                                    provider.id,
+                                    removed_reasoning_items
+                                );
+                                self.record_success_result(
+                                    &provider.id,
+                                    app_type_str,
+                                    half_open_permit.take(),
+                                )
+                                .await;
+
+                                {
+                                    let mut current_providers =
+                                        self.current_providers.write().await;
+                                    current_providers.insert(
+                                        app_type_str.to_string(),
+                                        (provider.id.clone(), provider.name.clone()),
+                                    );
+                                }
+
+                                {
+                                    let mut status = self.status.write().await;
+                                    status.success_requests += 1;
+                                    status.last_error = None;
+                                    let should_switch = self.current_provider_id_at_start.as_str()
+                                        != provider.id.as_str();
+                                    if should_switch {
+                                        status.failover_count += 1;
+                                        let fm = self.failover_manager.clone();
+                                        let ah = self.app_handle.clone();
+                                        let pid = provider.id.clone();
+                                        let pname = provider.name.clone();
+                                        let at = app_type_str.to_string();
+
+                                        tokio::spawn(async move {
+                                            let _ =
+                                                fm.try_switch(ah.as_ref(), &at, &pid, &pname).await;
+                                        });
+                                    }
+                                    if status.total_requests > 0 {
+                                        status.success_rate = (status.success_requests as f32
+                                            / status.total_requests as f32)
+                                            * 100.0;
+                                    }
+                                }
+
+                                return Ok(ForwardResult {
+                                    response,
+                                    provider: provider.clone(),
+                                    claude_api_format,
+                                    outbound_model,
+                                    connection_guard: None,
+                                });
+                            }
+                            Err(retry_err) => {
+                                log::warn!(
+                                    "[{app_type_str}] [EncryptedContent] Recovery retry still failed for provider={}: {retry_err}",
+                                    provider.id
+                                );
+                                if let Some(err) = self
+                                    .handle_rectifier_retry_failure(
+                                        retry_err,
+                                        provider,
+                                        app_type_str,
+                                        &mut half_open_permit,
+                                        "encrypted_content 恢复",
+                                        attempt_outbound_model.as_deref(),
+                                        &mut last_error,
+                                        &mut last_provider,
+                                    )
+                                    .await
+                                {
+                                    return Err(err);
+                                }
+                                continue;
+                            }
+                        }
+                    }
+
                     // 检测是否需要触发整流器（仅 Claude/ClaudeAuth 供应商）
                     let provider_type = ProviderType::from_app_type_and_config(app_type, provider);
                     let is_anthropic_provider = matches!(
@@ -654,7 +922,7 @@ impl RequestForwarder {
                                     self.record_success_result(
                                         &provider.id,
                                         app_type_str,
-                                        used_half_open_permit,
+                                        half_open_permit.take(),
                                     )
                                     .await;
 
@@ -712,8 +980,9 @@ impl RequestForwarder {
                                             retry_err,
                                             provider,
                                             app_type_str,
-                                            used_half_open_permit,
+                                            &mut half_open_permit,
                                             "media 降级",
+                                            attempt_outbound_model.as_deref(),
                                             &mut last_error,
                                             &mut last_provider,
                                         )
@@ -741,7 +1010,7 @@ impl RequestForwarder {
                                     .release_permit_neutral(
                                         &provider.id,
                                         app_type_str,
-                                        used_half_open_permit,
+                                        half_open_permit.take(),
                                     )
                                     .await;
                                 let mut status = self.status.write().await;
@@ -755,6 +1024,7 @@ impl RequestForwarder {
                                 return Err(ForwardError {
                                     error: e,
                                     provider: Some(provider.clone()),
+                                    outbound_model: attempt_outbound_model.clone(),
                                 });
                             }
 
@@ -798,7 +1068,7 @@ impl RequestForwarder {
                                         self.record_success_result(
                                             &provider.id,
                                             app_type_str,
-                                            used_half_open_permit,
+                                            half_open_permit.take(),
                                         )
                                         .await;
 
@@ -861,8 +1131,9 @@ impl RequestForwarder {
                                                 retry_err,
                                                 provider,
                                                 app_type_str,
-                                                used_half_open_permit,
+                                                &mut half_open_permit,
                                                 "整流",
+                                                attempt_outbound_model.as_deref(),
                                                 &mut last_error,
                                                 &mut last_provider,
                                             )
@@ -893,7 +1164,7 @@ impl RequestForwarder {
                                     .release_permit_neutral(
                                         &provider.id,
                                         app_type_str,
-                                        used_half_open_permit,
+                                        half_open_permit.take(),
                                     )
                                     .await;
                                 let mut status = self.status.write().await;
@@ -907,6 +1178,7 @@ impl RequestForwarder {
                                 return Err(ForwardError {
                                     error: e,
                                     provider: Some(provider.clone()),
+                                    outbound_model: attempt_outbound_model.clone(),
                                 });
                             }
 
@@ -919,7 +1191,7 @@ impl RequestForwarder {
                                     .release_permit_neutral(
                                         &provider.id,
                                         app_type_str,
-                                        used_half_open_permit,
+                                        half_open_permit.take(),
                                     )
                                     .await;
                                 let mut status = self.status.write().await;
@@ -933,6 +1205,7 @@ impl RequestForwarder {
                                 return Err(ForwardError {
                                     error: e,
                                     provider: Some(provider.clone()),
+                                    outbound_model: attempt_outbound_model.clone(),
                                 });
                             }
 
@@ -964,7 +1237,7 @@ impl RequestForwarder {
                                     self.record_success_result(
                                         &provider.id,
                                         app_type_str,
-                                        used_half_open_permit,
+                                        half_open_permit.take(),
                                     )
                                     .await;
 
@@ -1021,8 +1294,9 @@ impl RequestForwarder {
                                             retry_err,
                                             provider,
                                             app_type_str,
-                                            used_half_open_permit,
+                                            &mut half_open_permit,
                                             "budget 整流",
+                                            attempt_outbound_model.as_deref(),
                                             &mut last_error,
                                             &mut last_provider,
                                         )
@@ -1041,7 +1315,7 @@ impl RequestForwarder {
                             .release_permit_neutral(
                                 &provider.id,
                                 app_type_str,
-                                used_half_open_permit,
+                                half_open_permit.take(),
                             )
                             .await;
                         let mut status = self.status.write().await;
@@ -1055,6 +1329,7 @@ impl RequestForwarder {
                         return Err(ForwardError {
                             error: e,
                             provider: Some(provider.clone()),
+                            outbound_model: attempt_outbound_model.clone(),
                         });
                     }
 
@@ -1071,7 +1346,7 @@ impl RequestForwarder {
                                 .record_result(
                                     &provider.id,
                                     app_type_str,
-                                    used_half_open_permit,
+                                    half_open_permit.take(),
                                     false,
                                     Some(e.to_string()),
                                 )
@@ -1102,7 +1377,7 @@ impl RequestForwarder {
                                 .release_permit_neutral(
                                     &provider.id,
                                     app_type_str,
-                                    used_half_open_permit,
+                                    half_open_permit.take(),
                                 )
                                 .await;
                             {
@@ -1118,6 +1393,7 @@ impl RequestForwarder {
                             return Err(ForwardError {
                                 error: e,
                                 provider: Some(provider.clone()),
+                                outbound_model: attempt_outbound_model.clone(),
                             });
                         }
                     }
@@ -1129,7 +1405,9 @@ impl RequestForwarder {
             // providers 列表非空，但全部被熔断器拒绝（典型：HalfOpen 探测名额被占用）
             {
                 let mut status = self.status.write().await;
-                status.failed_requests += 1;
+                if !self.retry_until_success {
+                    status.failed_requests += 1;
+                }
                 status.last_error = Some("所有供应商暂时不可用（熔断器限制）".to_string());
                 if status.total_requests > 0 {
                     status.success_rate =
@@ -1139,13 +1417,16 @@ impl RequestForwarder {
             return Err(ForwardError {
                 error: ProxyError::NoAvailableProvider,
                 provider: None,
+                outbound_model: None,
             });
         }
 
         // 所有供应商都失败了
         {
             let mut status = self.status.write().await;
-            status.failed_requests += 1;
+            if !self.retry_until_success {
+                status.failed_requests += 1;
+            }
             status.last_error = Some("所有供应商都失败".to_string());
             if status.total_requests > 0 {
                 status.success_rate =
@@ -1162,6 +1443,7 @@ impl RequestForwarder {
         Err(ForwardError {
             error: last_error.unwrap_or(ProxyError::MaxRetriesExceeded),
             provider: last_provider,
+            outbound_model: last_outbound_model,
         })
     }
 
@@ -2863,6 +3145,74 @@ impl RequestForwarder {
     }
 }
 
+fn is_invalid_encrypted_content_error(error: &ProxyError) -> bool {
+    let ProxyError::UpstreamError {
+        status: 400,
+        body: Some(body),
+    } = error
+    else {
+        return false;
+    };
+
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .is_some_and(|value| json_contains_invalid_encrypted_content_code(&value, 0))
+}
+
+fn json_contains_invalid_encrypted_content_code(value: &Value, depth: u8) -> bool {
+    let code = value
+        .pointer("/error/code")
+        .or_else(|| value.get("code"))
+        .and_then(Value::as_str);
+    if code == Some("invalid_encrypted_content") {
+        return true;
+    }
+
+    if depth >= 3 {
+        return false;
+    }
+
+    json_strings_contain_invalid_encrypted_content_code(value, depth)
+}
+
+fn json_strings_contain_invalid_encrypted_content_code(value: &Value, depth: u8) -> bool {
+    match value {
+        Value::String(text) => {
+            let text = text.trim();
+            (text.starts_with('{') || text.starts_with('[') || text.starts_with('"'))
+                && serde_json::from_str::<Value>(text)
+                    .ok()
+                    .is_some_and(|nested| {
+                        json_contains_invalid_encrypted_content_code(&nested, depth + 1)
+                    })
+        }
+        Value::Object(object) => object
+            .values()
+            .any(|child| json_strings_contain_invalid_encrypted_content_code(child, depth)),
+        Value::Array(items) => items
+            .iter()
+            .any(|child| json_strings_contain_invalid_encrypted_content_code(child, depth)),
+        _ => false,
+    }
+}
+
+fn remove_stale_codex_encrypted_reasoning_items(body: &mut Value) -> usize {
+    let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) else {
+        return 0;
+    };
+
+    let before = input.len();
+    input.retain(|item| {
+        let is_reasoning = item.get("type").and_then(Value::as_str) == Some("reasoning");
+        let has_encrypted_content = item
+            .get("encrypted_content")
+            .and_then(Value::as_str)
+            .is_some_and(|ciphertext| !ciphertext.trim().is_empty());
+        !(is_reasoning && has_encrypted_content)
+    });
+    before.saturating_sub(input.len())
+}
+
 /// 从 ProxyError 中提取错误消息
 fn extract_error_message(error: &ProxyError) -> Option<String> {
     match error {
@@ -3869,8 +4219,8 @@ mod tests {
     use super::*;
     use crate::database::Database;
     use crate::provider::{
-        HttpFailoverAction, LocalProxyRequestOverrides, ProviderFailoverPolicy, ProviderMeta,
-        ProviderProxyConfig, ProviderProxyMode,
+        CodexModelMappingConfig, HttpFailoverAction, LocalProxyRequestOverrides,
+        ProviderFailoverPolicy, ProviderMeta, ProviderProxyConfig, ProviderProxyMode,
     };
     use axum::http::header::{HeaderValue, ACCEPT};
     use axum::http::HeaderMap;
@@ -3915,6 +4265,198 @@ mod tests {
             ..ProviderMeta::default()
         });
         provider
+    }
+
+    async fn spawn_codex_model_capture_upstream(
+        status: StatusCode,
+    ) -> (
+        String,
+        Arc<std::sync::Mutex<Option<Value>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let captured_for_route = captured.clone();
+        let app = Router::new().fallback(any(move |Json(body): Json<Value>| {
+            let captured = captured_for_route.clone();
+            async move {
+                *captured.lock().expect("capture request") = Some(body);
+                (
+                    status,
+                    Json(json!({
+                        "id": "resp_test",
+                        "object": "response",
+                        "status": "completed",
+                        "model": "gpt-6-astra",
+                        "output": [],
+                        "usage": {
+                            "input_tokens": 1,
+                            "output_tokens": 1,
+                            "total_tokens": 2
+                        }
+                    })),
+                )
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind codex capture upstream");
+        let addr = listener
+            .local_addr()
+            .expect("codex capture upstream address");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve codex capture upstream");
+        });
+        (format!("http://{addr}"), captured, handle)
+    }
+
+    async fn spawn_codex_invalid_encrypted_then_status_upstream(
+        recovery_status: StatusCode,
+    ) -> (
+        String,
+        Arc<AtomicUsize>,
+        Arc<std::sync::Mutex<Vec<Value>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let requests_for_route = requests.clone();
+        let captured_for_route = captured.clone();
+        let app = Router::new().fallback(any(move |Json(body): Json<Value>| {
+            let requests = requests_for_route.clone();
+            let captured = captured_for_route.clone();
+            async move {
+                requests.fetch_add(1, Ordering::SeqCst);
+                captured
+                    .lock()
+                    .expect("capture Codex encrypted-content request")
+                    .push(body.clone());
+
+                let has_stale_reasoning = body
+                    .get("input")
+                    .and_then(Value::as_array)
+                    .is_some_and(|items| {
+                        items.iter().any(|item| {
+                            item.get("type").and_then(Value::as_str) == Some("reasoning")
+                                && item.get("encrypted_content").is_some()
+                        })
+                    });
+
+                if has_stale_reasoning {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "error": {
+                                "message": "bad response status code 400 (request id: test-invalid-encrypted)",
+                                "type": "invalid_request_error",
+                                "code": "invalid_encrypted_content",
+                                "param": ""
+                            }
+                        })),
+                    )
+                        .into_response()
+                } else if recovery_status.is_success() {
+                    (
+                        recovery_status,
+                        Json(json!({
+                            "id": "resp_recovered",
+                            "object": "response",
+                            "status": "completed",
+                            "model": "gpt-6-astra",
+                            "output": [],
+                            "usage": {
+                                "input_tokens": 1,
+                                "output_tokens": 1,
+                                "total_tokens": 2
+                            }
+                        })),
+                    )
+                        .into_response()
+                } else {
+                    (
+                        recovery_status,
+                        Json(json!({
+                            "error": {
+                                "message": "request still failed after encrypted-content recovery"
+                            }
+                        })),
+                    )
+                        .into_response()
+                }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind Codex encrypted-content test upstream");
+        let addr = listener
+            .local_addr()
+            .expect("Codex encrypted-content test upstream address");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve Codex encrypted-content test upstream");
+        });
+        (format!("http://{addr}"), requests, captured, handle)
+    }
+
+    async fn spawn_codex_invalid_encrypted_recovery_upstream() -> (
+        String,
+        Arc<AtomicUsize>,
+        Arc<std::sync::Mutex<Vec<Value>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        spawn_codex_invalid_encrypted_then_status_upstream(StatusCode::OK).await
+    }
+
+    async fn spawn_sequence_status_upstream(
+        failures_before_success: usize,
+        failure_status: StatusCode,
+    ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let requests_for_route = requests.clone();
+        let app = Router::new().fallback(any(move || {
+            let requests = requests_for_route.clone();
+            async move {
+                let attempt = requests.fetch_add(1, Ordering::SeqCst) + 1;
+                if attempt <= failures_before_success {
+                    (
+                        failure_status,
+                        Json(json!({ "error": { "message": "temporary upstream failure" } })),
+                    )
+                        .into_response()
+                } else {
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "id": "msg_test",
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{ "type": "text", "text": "ok" }],
+                            "model": "claude-test",
+                            "stop_reason": "end_turn",
+                            "usage": { "input_tokens": 1, "output_tokens": 1 }
+                        })),
+                    )
+                        .into_response()
+                }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind sequence test upstream");
+        let addr = listener
+            .local_addr()
+            .expect("sequence test upstream address");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve sequence test upstream");
+        });
+        (format!("http://{addr}"), requests, handle)
     }
 
     async fn spawn_status_upstream(
@@ -3991,6 +4533,60 @@ mod tests {
         provider
     }
 
+    fn test_codex_upstream_provider(
+        id: &str,
+        base_url: &str,
+        override_action: Option<(u16, HttpFailoverAction)>,
+    ) -> Provider {
+        let mut provider = Provider::with_id(
+            id.to_string(),
+            format!("Provider {id}"),
+            json!({
+                "base_url": base_url,
+                "auth": { "OPENAI_API_KEY": "test-key" }
+            }),
+            None,
+        );
+        provider.meta = Some(ProviderMeta {
+            api_format: Some("openai_responses".to_string()),
+            failover_policy: override_action.map(|(status, action)| ProviderFailoverPolicy {
+                http_status_overrides: HashMap::from([(status, action)]),
+            }),
+            proxy_config: Some(ProviderProxyConfig {
+                mode: Some(ProviderProxyMode::Direct),
+                ..ProviderProxyConfig::default()
+            }),
+            ..ProviderMeta::default()
+        });
+        provider
+    }
+
+    fn codex_request_with_encrypted_reasoning() -> Value {
+        json!({
+            "model": "gpt-6-astra",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": "continue" }]
+                },
+                {
+                    "type": "reasoning",
+                    "id": "rs_stale",
+                    "summary": [{ "type": "summary_text", "text": "old reasoning" }],
+                    "encrypted_content": "opaque-from-provider-a"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "ok"
+                }
+            ],
+            "include": ["reasoning.encrypted_content"],
+            "stream": false
+        })
+    }
+
     async fn run_http_failover_case(
         status: u16,
         action: Option<HttpFailoverAction>,
@@ -4041,12 +4637,11 @@ mod tests {
         handle_b.abort();
     }
 
-    fn test_forwarder(
+    fn test_forwarder_with_db(
+        db: Arc<Database>,
         non_streaming_timeout: Duration,
         streaming_first_byte_timeout: Duration,
     ) -> RequestForwarder {
-        let db = Arc::new(Database::memory().expect("memory db"));
-
         RequestForwarder {
             router: Arc::new(ProviderRouter::new(db.clone())),
             status: Arc::new(RwLock::new(ProxyStatus::default())),
@@ -4064,7 +4659,435 @@ mod tests {
             non_streaming_timeout,
             streaming_first_byte_timeout,
             max_attempts: 1,
+            retry_until_success: false,
+            auto_failover_enabled: false,
         }
+    }
+
+    fn test_forwarder(
+        non_streaming_timeout: Duration,
+        streaming_first_byte_timeout: Duration,
+    ) -> RequestForwarder {
+        let db = Arc::new(Database::memory().expect("memory db"));
+        test_forwarder_with_db(db, non_streaming_timeout, streaming_first_byte_timeout)
+    }
+
+    #[tokio::test]
+    async fn codex_forwarder_sends_mapped_gpt_6_astra_model_upstream() {
+        let (base_url, captured, handle) = spawn_codex_model_capture_upstream(StatusCode::OK).await;
+        let mut provider = Provider::with_id(
+            "codex-map".to_string(),
+            "Codex Mapping".to_string(),
+            json!({
+                "base_url": base_url,
+                "auth": { "OPENAI_API_KEY": "test-key" }
+            }),
+            None,
+        );
+        provider.meta = Some(ProviderMeta {
+            api_format: Some("openai_responses".to_string()),
+            codex_model_mapping: Some(CodexModelMappingConfig {
+                enabled: true,
+                model_map: HashMap::from([("gpt-5.6-sol".to_string(), "gpt-6-astra".to_string())]),
+                effort_map: HashMap::new(),
+            }),
+            proxy_config: Some(ProviderProxyConfig {
+                mode: Some(ProviderProxyMode::Direct),
+                ..ProviderProxyConfig::default()
+            }),
+            ..ProviderMeta::default()
+        });
+        let forwarder = test_forwarder(Duration::from_secs(5), Duration::from_secs(5));
+
+        let result = forwarder
+            .forward_with_retry(
+                &AppType::Codex,
+                http::Method::POST,
+                "/responses",
+                json!({
+                    "model": "gpt-5.6-sol",
+                    "input": "hello",
+                    "stream": false,
+                    "reasoning": { "effort": "high" }
+                }),
+                HeaderMap::new(),
+                Extensions::new(),
+                vec![provider],
+            )
+            .await;
+        let Ok(result) = result else {
+            panic!("mapped Codex request should succeed");
+        };
+
+        assert_eq!(result.outbound_model.as_deref(), Some("gpt-6-astra"));
+        let body = captured
+            .lock()
+            .expect("read captured request")
+            .clone()
+            .expect("upstream request captured");
+        assert_eq!(body["model"], "gpt-6-astra");
+        assert_eq!(body["reasoning"]["effort"], "high");
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_forwarder_error_retains_mapped_outbound_model() {
+        let (base_url, captured, handle) =
+            spawn_codex_model_capture_upstream(StatusCode::INTERNAL_SERVER_ERROR).await;
+        let mut provider = Provider::with_id(
+            "codex-map-error".to_string(),
+            "Codex Mapping Error".to_string(),
+            json!({
+                "base_url": base_url,
+                "auth": { "OPENAI_API_KEY": "test-key" }
+            }),
+            None,
+        );
+        provider.meta = Some(ProviderMeta {
+            api_format: Some("openai_responses".to_string()),
+            codex_model_mapping: Some(CodexModelMappingConfig {
+                enabled: true,
+                model_map: HashMap::from([("gpt-5.6-sol".to_string(), "gpt-6-astra".to_string())]),
+                effort_map: HashMap::new(),
+            }),
+            proxy_config: Some(ProviderProxyConfig {
+                mode: Some(ProviderProxyMode::Direct),
+                ..ProviderProxyConfig::default()
+            }),
+            ..ProviderMeta::default()
+        });
+        let forwarder = test_forwarder(Duration::from_secs(5), Duration::from_secs(5));
+
+        let result = forwarder
+            .forward_with_retry(
+                &AppType::Codex,
+                http::Method::POST,
+                "/responses",
+                json!({
+                    "model": "gpt-5.6-sol",
+                    "input": "hello",
+                    "stream": false,
+                    "reasoning": { "effort": "high" }
+                }),
+                HeaderMap::new(),
+                Extensions::new(),
+                vec![provider],
+            )
+            .await;
+        let Err(error) = result else {
+            panic!("mapped Codex request should preserve the outbound model on failure");
+        };
+
+        assert_eq!(error.outbound_model.as_deref(), Some("gpt-6-astra"));
+        let body = captured
+            .lock()
+            .expect("read captured request")
+            .clone()
+            .expect("upstream request captured");
+        assert_eq!(body["model"], "gpt-6-astra");
+        handle.abort();
+    }
+
+    #[test]
+    fn invalid_encrypted_content_detection_is_specific_to_upstream_error_code() {
+        let matching = ProxyError::UpstreamError {
+            status: 400,
+            body: Some(
+                json!({
+                    "error": {
+                        "message": "bad response status code 400",
+                        "code": "invalid_encrypted_content"
+                    }
+                })
+                .to_string(),
+            ),
+        };
+        let generic_400 = ProxyError::UpstreamError {
+            status: 400,
+            body: Some(json!({ "error": { "message": "bad request" } }).to_string()),
+        };
+        let matching_wrong_status = ProxyError::UpstreamError {
+            status: 500,
+            body: Some(json!({ "error": { "code": "invalid_encrypted_content" } }).to_string()),
+        };
+        let wrapped_json = ProxyError::UpstreamError {
+            status: 400,
+            body: Some(
+                json!({
+                    "error": {
+                        "message": json!({
+                            "error": { "code": "invalid_encrypted_content" }
+                        })
+                        .to_string()
+                    }
+                })
+                .to_string(),
+            ),
+        };
+        let mentioned_only = ProxyError::UpstreamError {
+            status: 400,
+            body: Some(
+                json!({
+                    "error": {
+                        "message": "See invalid_encrypted_content documentation",
+                        "code": "bad_request"
+                    }
+                })
+                .to_string(),
+            ),
+        };
+        let plain_text = ProxyError::UpstreamError {
+            status: 400,
+            body: Some("gateway mentioned invalid_encrypted_content".to_string()),
+        };
+
+        assert!(is_invalid_encrypted_content_error(&matching));
+        assert!(is_invalid_encrypted_content_error(&wrapped_json));
+        assert!(!is_invalid_encrypted_content_error(&generic_400));
+        assert!(!is_invalid_encrypted_content_error(&matching_wrong_status));
+        assert!(!is_invalid_encrypted_content_error(&mentioned_only));
+        assert!(!is_invalid_encrypted_content_error(&plain_text));
+    }
+
+    #[test]
+    fn encrypted_content_recovery_drops_only_stale_reasoning_items() {
+        let mut body = json!({
+            "model": "gpt-6-astra",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": "continue" }]
+                },
+                {
+                    "type": "reasoning",
+                    "id": "rs_stale",
+                    "summary": [{ "type": "summary_text", "text": "old reasoning" }],
+                    "encrypted_content": "opaque-from-another-upstream"
+                },
+                {
+                    "type": "reasoning",
+                    "id": "rs_portable_summary_only",
+                    "summary": [{ "type": "summary_text", "text": "summary only" }]
+                },
+                {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "name": "tool",
+                    "arguments": "{}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "ok"
+                }
+            ],
+            "include": ["reasoning.encrypted_content"]
+        });
+
+        assert_eq!(remove_stale_codex_encrypted_reasoning_items(&mut body), 1);
+        let input = body["input"].as_array().expect("input array");
+        assert_eq!(input.len(), 4);
+        assert!(input.iter().any(|item| item["type"] == "message"));
+        assert!(input.iter().any(|item| item["type"] == "function_call"));
+        assert!(input
+            .iter()
+            .any(|item| item["type"] == "function_call_output"));
+        assert!(input.iter().any(|item| {
+            item["type"] == "reasoning" && item.get("encrypted_content").is_none()
+        }));
+        assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+    }
+
+    #[test]
+    fn encrypted_content_recovery_keeps_empty_or_non_string_ciphertext_items() {
+        let mut body = json!({
+            "input": [
+                { "type": "reasoning", "encrypted_content": "" },
+                { "type": "reasoning", "encrypted_content": "   " },
+                { "type": "reasoning", "encrypted_content": null },
+                { "type": "reasoning", "encrypted_content": 42 }
+            ]
+        });
+
+        assert_eq!(remove_stale_codex_encrypted_reasoning_items(&mut body), 0);
+        assert_eq!(body["input"].as_array().map(Vec::len), Some(4));
+    }
+
+    #[tokio::test]
+    async fn codex_invalid_encrypted_content_is_rectified_and_retried_same_provider() {
+        let (base_url, requests, captured, handle) =
+            spawn_codex_invalid_encrypted_recovery_upstream().await;
+        let mut provider = Provider::with_id(
+            "codex-encrypted-recovery".to_string(),
+            "Codex Encrypted Recovery".to_string(),
+            json!({
+                "base_url": base_url,
+                "auth": { "OPENAI_API_KEY": "test-key" }
+            }),
+            None,
+        );
+        provider.meta = Some(ProviderMeta {
+            api_format: Some("openai_responses".to_string()),
+            proxy_config: Some(ProviderProxyConfig {
+                mode: Some(ProviderProxyMode::Direct),
+                ..ProviderProxyConfig::default()
+            }),
+            ..ProviderMeta::default()
+        });
+        let forwarder = test_forwarder(Duration::from_secs(5), Duration::from_secs(5));
+
+        let result = forwarder
+            .forward_with_retry(
+                &AppType::Codex,
+                http::Method::POST,
+                "/responses",
+                json!({
+                    "model": "gpt-6-astra",
+                    "input": [
+                        {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{ "type": "input_text", "text": "continue" }]
+                        },
+                        {
+                            "type": "reasoning",
+                            "id": "rs_stale",
+                            "summary": [{ "type": "summary_text", "text": "old reasoning" }],
+                            "encrypted_content": "opaque-from-provider-a"
+                        },
+                        {
+                            "type": "function_call",
+                            "id": "fc_1",
+                            "call_id": "call_1",
+                            "name": "tool",
+                            "arguments": "{}"
+                        },
+                        {
+                            "type": "function_call_output",
+                            "call_id": "call_1",
+                            "output": "ok"
+                        }
+                    ],
+                    "include": ["reasoning.encrypted_content"],
+                    "stream": false
+                }),
+                HeaderMap::new(),
+                Extensions::new(),
+                vec![provider],
+            )
+            .await;
+
+        let Ok(result) = result else {
+            panic!("invalid encrypted reasoning should be repaired and retried");
+        };
+        assert_eq!(result.provider.id, "codex-encrypted-recovery");
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+
+        let captured = captured.lock().expect("captured recovery requests");
+        assert_eq!(captured.len(), 2);
+        let first_input = captured[0]["input"].as_array().expect("first input");
+        assert!(first_input.iter().any(|item| {
+            item["type"] == "reasoning" && item.get("encrypted_content").is_some()
+        }));
+
+        let second = &captured[1];
+        let second_input = second["input"].as_array().expect("second input");
+        assert!(!second_input.iter().any(|item| {
+            item["type"] == "reasoning" && item.get("encrypted_content").is_some()
+        }));
+        assert!(second_input.iter().any(|item| item["type"] == "message"));
+        assert!(second_input
+            .iter()
+            .any(|item| item["type"] == "function_call"));
+        assert!(second_input
+            .iter()
+            .any(|item| item["type"] == "function_call_output"));
+        assert_eq!(second["include"], json!(["reasoning.encrypted_content"]));
+        drop(captured);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_invalid_encrypted_content_recovery_retryable_failure_fails_over() {
+        let (base_url_a, requests_a, _, handle_a) =
+            spawn_codex_invalid_encrypted_then_status_upstream(StatusCode::INTERNAL_SERVER_ERROR)
+                .await;
+        let (base_url_b, captured_b, handle_b) =
+            spawn_codex_model_capture_upstream(StatusCode::OK).await;
+        let provider_a = test_codex_upstream_provider("a", &base_url_a, None);
+        let provider_b = test_codex_upstream_provider("b", &base_url_b, None);
+        let mut forwarder = test_forwarder(Duration::from_secs(5), Duration::from_secs(5));
+        forwarder.max_attempts = 2;
+
+        let result = forwarder
+            .forward_with_retry(
+                &AppType::Codex,
+                http::Method::POST,
+                "/responses",
+                codex_request_with_encrypted_reasoning(),
+                HeaderMap::new(),
+                Extensions::new(),
+                vec![provider_a, provider_b],
+            )
+            .await;
+        let Ok(result) = result else {
+            panic!("retryable recovery failure should reach provider B");
+        };
+
+        assert_eq!(result.provider.id, "b");
+        assert_eq!(requests_a.load(Ordering::SeqCst), 2);
+        assert!(
+            captured_b.lock().expect("provider B capture").is_some(),
+            "provider B must be attempted exactly once"
+        );
+        handle_a.abort();
+        handle_b.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_invalid_encrypted_content_recovery_nonretryable_failure_stops() {
+        let (base_url_a, requests_a, _, handle_a) =
+            spawn_codex_invalid_encrypted_then_status_upstream(StatusCode::BAD_REQUEST).await;
+        let (base_url_b, captured_b, handle_b) =
+            spawn_codex_model_capture_upstream(StatusCode::OK).await;
+        let provider_a =
+            test_codex_upstream_provider("a", &base_url_a, Some((400, HttpFailoverAction::Stop)));
+        let provider_b = test_codex_upstream_provider("b", &base_url_b, None);
+        let mut forwarder = test_forwarder(Duration::from_secs(5), Duration::from_secs(5));
+        forwarder.max_attempts = 2;
+
+        let result = forwarder
+            .forward_with_retry(
+                &AppType::Codex,
+                http::Method::POST,
+                "/responses",
+                codex_request_with_encrypted_reasoning(),
+                HeaderMap::new(),
+                Extensions::new(),
+                vec![provider_a, provider_b],
+            )
+            .await;
+        let Err(error) = result else {
+            panic!("NonRetryable recovery failure must terminate the request");
+        };
+
+        assert_eq!(
+            error.provider.as_ref().map(|provider| provider.id.as_str()),
+            Some("a")
+        );
+        assert!(matches!(
+            error.error,
+            ProxyError::UpstreamError { status: 400, .. }
+        ));
+        assert_eq!(requests_a.load(Ordering::SeqCst), 2);
+        assert!(
+            captured_b.lock().expect("provider B capture").is_none(),
+            "provider B must not be attempted"
+        );
+        handle_a.abort();
+        handle_b.abort();
     }
 
     #[test]
@@ -4849,7 +5872,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upstream_http_overrides_drive_only_cross_provider_failover() {
+    async fn upstream_http_overrides_control_cross_provider_failover() {
         for (status, action, should_reach_b) in [
             (400, Some(HttpFailoverAction::Failover), true),
             (405, Some(HttpFailoverAction::Failover), true),
@@ -4864,16 +5887,113 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failover_override_does_not_retry_a_when_no_next_provider_exists() {
+    async fn retryable_400_and_405_overrides_retry_single_provider_without_failover() {
+        for status in [StatusCode::BAD_REQUEST, StatusCode::METHOD_NOT_ALLOWED] {
+            let (base_url_a, requests_a, handle_a) = spawn_status_upstream(status).await;
+            let provider_a = test_claude_upstream_provider(
+                "a",
+                &base_url_a,
+                Some((status.as_u16(), HttpFailoverAction::Failover)),
+            );
+            let mut forwarder = test_forwarder(Duration::from_secs(5), Duration::from_secs(5));
+            forwarder.max_attempts = 2;
+
+            let result = forwarder
+                .forward_with_retry(
+                    &AppType::Claude,
+                    http::Method::POST,
+                    "/v1/messages",
+                    json!({
+                        "model": "claude-test",
+                        "max_tokens": 64,
+                        "messages": [{ "role": "user", "content": "test" }],
+                        "stream": false
+                    }),
+                    HeaderMap::new(),
+                    Extensions::new(),
+                    vec![provider_a],
+                )
+                .await;
+
+            let Err(error) = result else {
+                panic!("Retryable HTTP status should return the last upstream error after retries");
+            };
+            match error.error {
+                ProxyError::UpstreamError {
+                    status: actual_status,
+                    ..
+                } => assert_eq!(actual_status, status.as_u16()),
+                _ => panic!("expected upstream HTTP error after retries"),
+            }
+            assert_eq!(requests_a.load(Ordering::SeqCst), 2);
+            handle_a.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn continuous_retry_waits_for_half_open_and_recovers() {
+        let db = Arc::new(Database::memory().expect("memory db"));
+        let (base_url, requests, handle) =
+            spawn_sequence_status_upstream(1, StatusCode::SERVICE_UNAVAILABLE).await;
+        let provider = test_claude_upstream_provider("a", &base_url, None);
+        db.save_provider("claude", &provider)
+            .expect("save test provider");
+        db.add_to_failover_queue("claude", &provider.id)
+            .expect("add provider to failover queue");
+
+        let mut config = db
+            .get_proxy_config_for_app("claude")
+            .await
+            .expect("load proxy config");
+        config.auto_failover_enabled = true;
+        config.max_retries = 0;
+        config.retry_until_success = true;
+        config.circuit_failure_threshold = 1;
+        config.circuit_timeout_seconds = 1;
+        db.update_proxy_config_for_app(config)
+            .await
+            .expect("save proxy config");
+
+        let mut forwarder =
+            test_forwarder_with_db(db, Duration::from_secs(5), Duration::from_secs(5));
+        forwarder.retry_until_success = true;
+        forwarder.auto_failover_enabled = true;
+        forwarder.max_attempts = 1;
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(4),
+            forwarder.forward_with_retry(
+                &AppType::Claude,
+                http::Method::POST,
+                "/v1/messages",
+                json!({
+                    "model": "claude-test",
+                    "max_tokens": 64,
+                    "messages": [{ "role": "user", "content": "test" }],
+                    "stream": false
+                }),
+                HeaderMap::new(),
+                Extensions::new(),
+                vec![provider],
+            ),
+        )
+        .await
+        .expect("continuous retry should recover before timeout");
+
+        assert!(result.is_ok(), "HalfOpen probe should recover the request");
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn nonretryable_override_stops_single_provider_without_retrying() {
         let (base_url_a, requests_a, handle_a) =
-            spawn_status_upstream(StatusCode::BAD_REQUEST).await;
-        let provider_a = test_claude_upstream_provider(
-            "a",
-            &base_url_a,
-            Some((400, HttpFailoverAction::Failover)),
-        );
+            spawn_status_upstream(StatusCode::INTERNAL_SERVER_ERROR).await;
+        let provider_a =
+            test_claude_upstream_provider("a", &base_url_a, Some((500, HttpFailoverAction::Stop)));
         let mut forwarder = test_forwarder(Duration::from_secs(5), Duration::from_secs(5));
-        forwarder.max_attempts = 2;
+        forwarder.max_attempts = 3;
+        forwarder.retry_until_success = true;
 
         let result = forwarder
             .forward_with_retry(
@@ -4892,7 +6012,13 @@ mod tests {
             )
             .await;
 
-        assert!(result.is_err());
+        let Err(error) = result else {
+            panic!("non-retryable 500 should pass the upstream error through");
+        };
+        assert!(matches!(
+            error.error,
+            ProxyError::UpstreamError { status: 500, .. }
+        ));
         assert_eq!(requests_a.load(Ordering::SeqCst), 1);
         handle_a.abort();
     }
@@ -4978,12 +6104,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rectifier_retry_failure_uses_override_without_changing_inherited_default() {
+    async fn rectifier_retry_failure_uses_central_provider_classification() {
         let forwarder = test_forwarder(Duration::ZERO, Duration::ZERO);
         let forced = test_provider_with_http_overrides([(400, HttpFailoverAction::Failover)]);
         let inherited = test_provider_with_type(None);
         let mut last_error = None;
         let mut last_provider = None;
+        let mut half_open_permit = None;
 
         let forced_result = forwarder
             .handle_rectifier_retry_failure(
@@ -4993,8 +6120,9 @@ mod tests {
                 },
                 &forced,
                 "claude",
-                false,
+                &mut half_open_permit,
                 "test",
+                None,
                 &mut last_error,
                 &mut last_provider,
             )
@@ -5013,13 +6141,37 @@ mod tests {
                 },
                 &inherited,
                 "claude",
-                false,
+                &mut half_open_permit,
                 "test",
+                None,
                 &mut last_error,
                 &mut last_provider,
             )
             .await;
-        assert!(inherited_result.is_some());
+        assert!(
+            inherited_result.is_none(),
+            "inherited 429 remains Retryable"
+        );
+
+        let inherited_501_result = forwarder
+            .handle_rectifier_retry_failure(
+                ProxyError::UpstreamError {
+                    status: 501,
+                    body: None,
+                },
+                &inherited,
+                "claude",
+                &mut half_open_permit,
+                "test",
+                None,
+                &mut last_error,
+                &mut last_provider,
+            )
+            .await;
+        assert!(
+            inherited_501_result.is_some(),
+            "inherited 501 remains NonRetryable"
+        );
     }
 
     #[test]

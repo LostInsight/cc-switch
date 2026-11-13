@@ -21,26 +21,26 @@ describe("ProviderFailoverPolicySection", () => {
     const user = userEvent.setup();
     render(<PolicyHarness />);
 
-    await user.click(
-      screen.getByRole("button", { name: "故障转移 HTTP 状态覆盖" }),
-    );
+    await user.click(screen.getByRole("button", { name: "HTTP 状态错误处理" }));
     const status400 = screen.getByLabelText("HTTP 400");
     await user.click(status400);
-    await user.click(screen.getByRole("option", { name: "继续下一家" }));
-    expect(status400).toHaveTextContent("继续下一家");
+    await user.click(
+      screen.getByRole("option", { name: "继续尝试（Retryable）" }),
+    );
+    expect(status400).toHaveTextContent("继续尝试（Retryable）");
 
     await user.type(screen.getByLabelText("自定义 HTTP 状态"), "529");
     await user.click(screen.getByRole("button", { name: "添加 HTTP 状态" }));
-    expect(screen.getByLabelText("HTTP 529")).toHaveTextContent("继续下一家");
+    expect(screen.getByLabelText("HTTP 529")).toHaveTextContent(
+      "继续尝试（Retryable）",
+    );
   });
 
   it("rejects custom statuses outside the HTTP error range", async () => {
     const user = userEvent.setup();
     render(<PolicyHarness />);
 
-    await user.click(
-      screen.getByRole("button", { name: "故障转移 HTTP 状态覆盖" }),
-    );
+    await user.click(screen.getByRole("button", { name: "HTTP 状态错误处理" }));
     await user.type(screen.getByLabelText("自定义 HTTP 状态"), "399");
     await user.click(screen.getByRole("button", { name: "添加 HTTP 状态" }));
 

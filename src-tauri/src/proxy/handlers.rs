@@ -216,6 +216,7 @@ async fn handle_messages_for_app(
     {
         Ok(result) => result,
         Err(mut err) => {
+            ctx.outbound_model = err.outbound_model.take();
             if let Some(provider) = err.provider.take() {
                 ctx.provider = provider;
             }
@@ -801,6 +802,7 @@ pub async fn handle_chat_completions(
     {
         Ok(result) => result,
         Err(mut err) => {
+            ctx.outbound_model = err.outbound_model.take();
             if let Some(provider) = err.provider.take() {
                 ctx.provider = provider;
             }
@@ -896,6 +898,7 @@ async fn handle_responses_for_app(
     {
         Ok(result) => result,
         Err(mut err) => {
+            ctx.outbound_model = err.outbound_model.take();
             if let Some(provider) = err.provider.take() {
                 ctx.provider = provider;
             }
@@ -1040,6 +1043,7 @@ async fn handle_codex_standalone_passthrough(
             if let Some(provider) = err.provider.take() {
                 ctx.provider = provider;
             }
+            ctx.outbound_model = err.outbound_model.take();
             log_forward_error(&state, &ctx, false, &err.error);
             return build_codex_proxy_error_response(&ctx, &endpoint, &err.error);
         }
@@ -1120,6 +1124,7 @@ async fn handle_responses_compact_for_app(
     {
         Ok(result) => result,
         Err(mut err) => {
+            ctx.outbound_model = err.outbound_model.take();
             if let Some(provider) = err.provider.take() {
                 ctx.provider = provider;
             }
@@ -1896,7 +1901,8 @@ fn build_codex_proxy_error_response(
 ) -> Result<axum::response::Response, ProxyError> {
     let status = axum::http::StatusCode::from_u16(map_proxy_error_to_status(error))
         .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
-    let body = codex_proxy_error_json(&ctx.provider.name, &ctx.request_model, endpoint, error);
+    let model = codex_proxy_error_model(&ctx.request_model, ctx.outbound_model.as_deref());
+    let body = codex_proxy_error_json(&ctx.provider.name, model, endpoint, error);
     let body = serde_json::to_vec(&body).map_err(|e| {
         log::error!("[Codex] 序列化代理错误体失败: {e}");
         ProxyError::Internal(format!("Failed to serialize proxy error: {e}"))
@@ -1913,6 +1919,12 @@ fn build_codex_proxy_error_response(
             log::error!("[Codex] 构建代理错误响应失败: {e}");
             ProxyError::Internal(format!("Failed to build proxy error response: {e}"))
         })
+}
+
+fn codex_proxy_error_model<'a>(request_model: &'a str, outbound_model: Option<&'a str>) -> &'a str {
+    outbound_model
+        .filter(|model| !model.trim().is_empty())
+        .unwrap_or(request_model)
 }
 
 fn codex_proxy_error_json(
@@ -2129,6 +2141,7 @@ pub async fn handle_gemini(
     {
         Ok(result) => result,
         Err(mut err) => {
+            ctx.outbound_model = err.outbound_model.take();
             if let Some(provider) = err.provider.take() {
                 ctx.provider = provider;
             }
@@ -2780,10 +2793,16 @@ fn log_forward_error(
     let error_message = get_error_message(error);
     let request_id = uuid::Uuid::new_v4().to_string();
 
+    let outbound_model = ctx
+        .outbound_model
+        .clone()
+        .unwrap_or_else(|| ctx.request_model.clone());
+
     if let Err(e) = logger.log_error_with_context(
         request_id,
         ctx.provider.id.clone(),
         ctx.app_type_str.to_string(),
+        outbound_model,
         ctx.request_model.clone(),
         status_code,
         error_message,
@@ -2858,7 +2877,7 @@ async fn log_usage(
 mod tests {
     use super::{
         body_looks_like_sse, chat_sse_to_response_value, classify_body_for_diagnostics,
-        codex_proxy_error_json, responses_sse_stream_to_anthropic_message,
+        codex_proxy_error_json, codex_proxy_error_model, responses_sse_stream_to_anthropic_message,
         responses_sse_to_response_value, should_use_claude_transform_streaming, transform,
         upstream_body_parse_error,
     };
@@ -3537,6 +3556,19 @@ data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"upstr
 data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\"}}\n\n";
 
         assert!(responses_sse_to_response_value(sse).is_err());
+    }
+
+    #[test]
+    fn codex_proxy_errors_prefer_actual_outbound_model() {
+        assert_eq!(
+            codex_proxy_error_model("gpt-5.6-sol", Some("gpt-6-astra")),
+            "gpt-6-astra"
+        );
+        assert_eq!(codex_proxy_error_model("gpt-5.6-sol", None), "gpt-5.6-sol");
+        assert_eq!(
+            codex_proxy_error_model("gpt-5.6-sol", Some("")),
+            "gpt-5.6-sol"
+        );
     }
 
     #[test]

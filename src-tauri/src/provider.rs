@@ -532,7 +532,11 @@ impl ProviderProxyConfig {
     }
 }
 
-/// Provider-specific cross-provider failover action for an upstream HTTP status.
+/// Provider-specific handling override for an upstream HTTP status.
+///
+/// The serialized values remain `failover` / `stop` for backward compatibility:
+/// `failover` means Retryable (continue trying), while `stop` means NonRetryable
+/// (pass the upstream error through immediately).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum HttpFailoverAction {
@@ -626,7 +630,7 @@ pub struct ProviderMeta {
     /// Provider 独立出站代理；缺失时跟随全局代理。
     #[serde(rename = "proxyConfig", skip_serializing_if = "Option::is_none")]
     pub proxy_config: Option<ProviderProxyConfig>,
-    /// Provider-specific upstream HTTP status overrides for cross-provider failover.
+    /// Provider-specific upstream HTTP status overrides for retry/pass-through classification.
     #[serde(
         rename = "failoverPolicy",
         skip_serializing_if = "failover_policy_is_empty"

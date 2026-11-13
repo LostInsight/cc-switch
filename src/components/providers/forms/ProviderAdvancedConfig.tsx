@@ -325,7 +325,7 @@ export function ProviderFailoverPolicySection({
           <ShieldAlert className="h-4 w-4 text-muted-foreground" />
           <span className="font-medium">
             {t("providerAdvanced.failoverPolicy", {
-              defaultValue: "故障转移 HTTP 状态覆盖",
+              defaultValue: "HTTP 状态错误处理",
             })}
           </span>
         </div>
@@ -345,7 +345,7 @@ export function ProviderFailoverPolicySection({
           <p className="text-sm text-muted-foreground">
             {t("providerAdvanced.failoverPolicyDesc", {
               defaultValue:
-                "仅控制上游 HTTP 错误是否继续到下一个故障转移供应商；继承保持当前默认行为。",
+                "覆盖此供应商的上游 HTTP 错误分类。继续尝试（Retryable）会在故障转移开启时尝试后续供应商，未开启时按请求重试次数重试当前供应商；透传错误（Non-retryable）会立即将上游错误返回客户端。继承默认使用内置分类。",
             })}
           </p>
           <div className="space-y-2">
@@ -379,12 +379,12 @@ export function ProviderFailoverPolicySection({
                       </SelectItem>
                       <SelectItem value="failover">
                         {t("providerAdvanced.failoverActionContinue", {
-                          defaultValue: "继续下一家",
+                          defaultValue: "继续尝试（Retryable）",
                         })}
                       </SelectItem>
                       <SelectItem value="stop">
                         {t("providerAdvanced.failoverActionStop", {
-                          defaultValue: "立即返回",
+                          defaultValue: "透传错误（Non-retryable）",
                         })}
                       </SelectItem>
                     </SelectContent>
@@ -454,12 +454,12 @@ export function ProviderFailoverPolicySection({
                 <SelectContent>
                   <SelectItem value="failover">
                     {t("providerAdvanced.failoverActionContinue", {
-                      defaultValue: "继续下一家",
+                      defaultValue: "继续尝试（Retryable）",
                     })}
                   </SelectItem>
                   <SelectItem value="stop">
                     {t("providerAdvanced.failoverActionStop", {
-                      defaultValue: "立即返回",
+                      defaultValue: "透传错误（Non-retryable）",
                     })}
                   </SelectItem>
                 </SelectContent>

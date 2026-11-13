@@ -3,6 +3,7 @@ import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Save, Loader2, Info } from "lucide-react";
 import { toast } from "sonner";
@@ -25,6 +26,7 @@ export function AutoFailoverConfigPanel({
   const [formData, setFormData] = useState({
     autoFailoverEnabled: false,
     maxRetries: "3",
+    retryUntilSuccess: false,
     streamingFirstByteTimeout: "60",
     streamingIdleTimeout: "120",
     nonStreamingTimeout: "600",
@@ -40,6 +42,7 @@ export function AutoFailoverConfigPanel({
       setFormData({
         autoFailoverEnabled: config.autoFailoverEnabled,
         maxRetries: String(config.maxRetries),
+        retryUntilSuccess: config.retryUntilSuccess,
         streamingFirstByteTimeout: String(config.streamingFirstByteTimeout),
         streamingIdleTimeout: String(config.streamingIdleTimeout),
         nonStreamingTimeout: String(config.nonStreamingTimeout),
@@ -53,6 +56,31 @@ export function AutoFailoverConfigPanel({
       });
     }
   }, [config]);
+
+  const handleRetryUntilSuccessChange = async (checked: boolean) => {
+    if (!config) return;
+
+    const previous = formData.retryUntilSuccess;
+    setFormData((current) => ({
+      ...current,
+      retryUntilSuccess: checked,
+    }));
+
+    try {
+      // This switch controls request-lifetime behavior and must take effect
+      // immediately. Persist only the toggle here so unrelated unsaved numeric
+      // edits in this form are not committed accidentally.
+      await updateConfig.mutateAsync({
+        ...config,
+        retryUntilSuccess: checked,
+      });
+    } catch {
+      setFormData((current) => ({
+        ...current,
+        retryUntilSuccess: previous,
+      }));
+    }
+  };
 
   const handleSave = async () => {
     if (!config) return;
@@ -102,11 +130,13 @@ export function AutoFailoverConfigPanel({
       }
     };
 
-    checkRange(
-      raw.maxRetries,
-      ranges.maxRetries,
-      t("proxy.autoFailover.maxRetries", "最大重试次数"),
-    );
+    if (!formData.retryUntilSuccess) {
+      checkRange(
+        raw.maxRetries,
+        ranges.maxRetries,
+        t("proxy.autoFailover.maxRetries", "最大重试次数"),
+      );
+    }
     checkRange(
       raw.streamingFirstByteTimeout,
       ranges.streamingFirstByteTimeout,
@@ -163,7 +193,10 @@ export function AutoFailoverConfigPanel({
         appType,
         enabled: config.enabled,
         autoFailoverEnabled: formData.autoFailoverEnabled,
-        maxRetries: raw.maxRetries,
+        maxRetries: formData.retryUntilSuccess
+          ? config.maxRetries
+          : raw.maxRetries,
+        retryUntilSuccess: formData.retryUntilSuccess,
         streamingFirstByteTimeout: raw.streamingFirstByteTimeout,
         streamingIdleTimeout: raw.streamingIdleTimeout,
         nonStreamingTimeout: raw.nonStreamingTimeout,
@@ -189,6 +222,7 @@ export function AutoFailoverConfigPanel({
       setFormData({
         autoFailoverEnabled: config.autoFailoverEnabled,
         maxRetries: String(config.maxRetries),
+        retryUntilSuccess: config.retryUntilSuccess,
         streamingFirstByteTimeout: String(config.streamingFirstByteTimeout),
         streamingIdleTimeout: String(config.streamingIdleTimeout),
         nonStreamingTimeout: String(config.nonStreamingTimeout),
@@ -238,6 +272,31 @@ export function AutoFailoverConfigPanel({
             {t("proxy.autoFailover.retrySettings", "重试与超时设置")}
           </h4>
 
+          <div className="flex items-start justify-between gap-4 rounded-md border border-border/60 bg-background/40 p-3">
+            <div className="space-y-1">
+              <Label htmlFor={`retryUntilSuccess-${appType}`}>
+                {t(
+                  "proxy.autoFailover.retryUntilSuccess",
+                  "持续尝试直到成功或取消",
+                )}
+              </Label>
+              <p className="text-xs text-muted-foreground">
+                {t(
+                  "proxy.autoFailover.retryUntilSuccessHint",
+                  "仅持续处理 Retryable 错误；Non-retryable 错误仍立即透传。所有供应商熔断时会等待 HalfOpen 恢复窗口后重新探测。",
+                )}
+              </p>
+            </div>
+            <Switch
+              id={`retryUntilSuccess-${appType}`}
+              checked={formData.retryUntilSuccess}
+              onCheckedChange={(checked) => {
+                void handleRetryUntilSuccessChange(checked);
+              }}
+              disabled={isDisabled}
+            />
+          </div>
+
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div className="space-y-2">
               <Label htmlFor={`maxRetries-${appType}`}>
@@ -252,12 +311,16 @@ export function AutoFailoverConfigPanel({
                 onChange={(e) =>
                   setFormData({ ...formData, maxRetries: e.target.value })
                 }
-                disabled={isDisabled}
+                disabled={isDisabled || formData.retryUntilSuccess}
               />
               <p className="text-xs text-muted-foreground">
                 {t(
-                  "proxy.autoFailover.maxRetriesHint",
-                  "请求失败时的重试次数（0-10）",
+                  formData.retryUntilSuccess
+                    ? "proxy.autoFailover.maxRetriesIgnoredHint"
+                    : "proxy.autoFailover.maxRetriesHint",
+                  formData.retryUntilSuccess
+                    ? "持续尝试已启用；最大重试次数在此模式下不生效。"
+                    : "Retryable 错误的继续尝试次数（0-10）；未启用故障转移时重试当前供应商，启用时优先继续后续供应商。",
                 )}
               </p>
             </div>

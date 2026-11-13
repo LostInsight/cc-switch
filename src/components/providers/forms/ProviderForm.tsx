@@ -444,6 +444,7 @@ function ProviderFormFull({
     setHasValidCodexOfficialSelection(true);
     setCodexFastMode(initialData?.meta?.codexFastMode ?? false);
     setCodexChatReasoning(initialData?.meta?.codexChatReasoning ?? {});
+    setCodexModelMapping(initialData?.meta?.codexModelMapping);
     setPromptCacheRouting(initialData?.meta?.promptCacheRouting ?? "auto");
     setCustomUserAgent(initialData?.meta?.customUserAgent ?? "");
     setLocalProxyHeadersOverride(

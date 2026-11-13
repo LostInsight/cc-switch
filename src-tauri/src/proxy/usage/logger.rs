@@ -301,6 +301,7 @@ impl<'a> UsageLogger<'a> {
         provider_id: String,
         app_type: String,
         model: String,
+        request_model: String,
         status_code: u16,
         error_message: String,
         latency_ms: u64,
@@ -308,7 +309,6 @@ impl<'a> UsageLogger<'a> {
         session_id: Option<String>,
         provider_type: Option<String>,
     ) -> Result<(), AppError> {
-        let request_model = model.clone();
         let log = RequestLog {
             request_id,
             provider_id,
@@ -587,6 +587,36 @@ mod tests {
             .unwrap();
         assert_eq!(count, 1);
         assert_eq!(request_model, "req-model");
+        Ok(())
+    }
+
+    #[test]
+    fn error_log_keeps_outbound_and_request_models_distinct() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        let logger = UsageLogger::new(&db);
+
+        logger.log_error_with_context(
+            "err-mapped".to_string(),
+            "provider-1".to_string(),
+            "codex".to_string(),
+            "gpt-6-astra".to_string(),
+            "gpt-5.6-sol".to_string(),
+            500,
+            "upstream failed".to_string(),
+            25,
+            false,
+            None,
+            None,
+        )?;
+
+        let conn = crate::database::lock_conn!(db.conn);
+        let (model, request_model): (String, String) = conn.query_row(
+            "SELECT model, request_model FROM proxy_request_logs WHERE request_id = 'err-mapped'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(model, "gpt-6-astra");
+        assert_eq!(request_model, "gpt-5.6-sol");
         Ok(())
     }
 

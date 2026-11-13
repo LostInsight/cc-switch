@@ -160,6 +160,21 @@ mod tests {
     }
 
     #[test]
+    fn maps_gpt_5_6_sol_to_gpt_6_astra() {
+        let provider = provider(&[("gpt-5.6-sol", "gpt-6-astra")]);
+        let mapped = apply(
+            json!({
+                "model": "gpt-5.6-sol",
+                "reasoning": {"effort": "high"}
+            }),
+            &provider,
+        );
+
+        assert_eq!(mapped["model"], "gpt-6-astra");
+        assert_eq!(mapped["reasoning"]["effort"], "high");
+    }
+
+    #[test]
     fn effort_route_wins_over_plain_route() {
         let mut provider = provider(&[("gpt-5.5", "plain")]);
         provider

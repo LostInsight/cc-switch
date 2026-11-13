@@ -5,6 +5,23 @@ All notable changes to CC Switch will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.20.5] - 2026-09-11
+
+### Fixed
+
+- Preserve Codex model mappings when reusing provider forms and record the source and mapped upstream models separately for failed requests.
+- Apply provider HTTP status overrides without requiring cross-provider failover, including retryable HTTP 400/405 responses and immediate non-retryable error returns.
+- Run the WSL2 nightly contract and full backend suite from precompiled test binaries, keeping Windows compilation temporary files off WSL UNC paths.
+
+### Added
+
+- Optional continuous retry for retryable failures, including waiting for circuit-breaker recovery. Existing configurations keep finite retries by default.
+- Persist continuous-retry settings through the proxy API and database schema migration from v18 to v19.
+
+### Changed
+
+- Clarify retryable and non-retryable actions in the provider editor across supported languages.
+
 ## [3.20.2] - 2026-09-07
 
 Development since v3.20.1 is again led by Codex, this time as a wave of compatibility repairs rather than one redesign. Grok models finally work through xAI's native Responses API under Codex routing — tool schemas xAI rejects are collapsed, whole-float numbers Codex refuses are rewritten, the agent_message mailbox items Codex's multi-agent mode injects are translated, and Codex's role SKUs are remapped onto the configured Grok model. Around it, a family of one-cause-each fixes: the v3.20.1 switch gate no longer refuses Grok OAuth cards, takeover no longer leaves Codex on the login screen after a direct third-party switch deleted `auth.json`, GPT-6 through Codex OAuth is no longer rejected for an outdated client version (#7132), Claude Code regains parallel tool calls on Codex OAuth (#7024), the built-in image generation tool is proxied (#7036), and four catalog defects — older Codex builds refusing the catalog (#6666), MCP tools invisible on DeepSeek presets (#6653), vision variants declared text-only (#6750), Kimi/Moonshot 400 on `$ref` schemas (#6863) — are closed, with the Zhipu GLM presets moved to Zhipu's official Responses endpoint (#6957). Usage accounting stops stalling after a Codex resume (#6905) and the proxy stops breaking the prompt prefix cache on every turn (#6941). The preset roster grows by Tencent Cloud Token Plan across six apps (#7011), QwenCloud across seven (#6214), AICodeWith across eight, and sponsors 9527CODE and SoleAPI across all nine, plus Tencent and PPIO for Pi; the pricing table gains seven new models and a September repricing pass (Sonnet 5 back to $2/$10, GPT-5.6 and Gemini 3.6/3.8 Flash promotional rates, MiniMax M2 family). This release does not change the database schema.

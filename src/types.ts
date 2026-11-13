@@ -195,7 +195,7 @@ export interface ProviderFailoverPolicy {
 export interface ProviderMeta {
   // Provider-specific outbound proxy selection. Missing data inherits global proxy.
   proxyConfig?: ProviderProxyConfig;
-  // Explicit cross-provider failover overrides. Missing statuses inherit current behavior.
+  // Upstream HTTP retry/pass-through overrides. Missing statuses inherit built-in classification.
   failoverPolicy?: ProviderFailoverPolicy;
   // 自定义端点：以 URL 为键，值为端点信息
   custom_endpoints?: Record<string, CustomEndpoint>;
