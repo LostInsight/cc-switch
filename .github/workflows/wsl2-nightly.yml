@@ -1,8 +1,9 @@
 name: WSL2 Nightly
 
-# The full backend suite takes 50+ minutes on a \\wsl.localhost 9P filesystem,
-# so it runs nightly instead of per PR. The per-PR gate in ci.yml only runs the
-# atomic-write contract test against the same WSL2-backed environment.
+# Exercise Windows-to-WSL2 config I/O on the real UNC filesystem. Keep the
+# complete backend suite on native Windows storage: moving TEMP to WSL also
+# moves SQLite test databases onto 9P, where Windows locking can return BUSY
+# even for the first connection. Do not disable SQLite locking to work around it.
 on:
   schedule:
     - cron: "23 18 * * *" # 02:23 Beijing time
@@ -10,7 +11,7 @@ on:
 
 jobs:
   backend-windows-wsl2-full:
-    name: Backend Full Suite (Windows + WSL2 home)
+    name: Backend Full Suite (Windows) + WSL2 config I/O
     runs-on: windows-2025
     timeout-minutes: 90
     permissions:
@@ -107,17 +108,34 @@ jobs:
             exit $LASTEXITCODE
           }
 
-      - name: Run full test suite against WSL2-backed home
+      - name: Run config tests against WSL2-backed home
         working-directory: src-tauri
         shell: pwsh
         run: |
           $env:TEMP = $env:CC_SWITCH_WSL_TEST_TEMP
           $env:TMP = $env:CC_SWITCH_WSL_TEST_TEMP
+          & $env:CC_SWITCH_TEST_EXE 'config::tests::' --test-threads=1
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+      - name: Run full test suite with native Windows storage
+        working-directory: src-tauri
+        env:
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
+        shell: pwsh
+        run: |
+          $env:TEMP = $env:RUNNER_TEMP
+          $env:TMP = $env:RUNNER_TEMP
+          $env:CC_SWITCH_TEST_HOME = Join-Path $env:RUNNER_TEMP 'cc-switch-native-test-home'
+          New-Item -ItemType Directory -Force -Path $env:CC_SWITCH_TEST_HOME | Out-Null
           $testBinaries = @(Get-Content -Raw -LiteralPath $env:CC_SWITCH_TEST_BINARIES | ConvertFrom-Json)
           if ($testBinaries.Count -eq 0) {
             throw "No precompiled test binaries found"
           }
           foreach ($testBinary in $testBinaries) {
+            Write-Host "Running complete test harness: $testBinary"
             & $testBinary --test-threads=1
             if ($LASTEXITCODE -ne 0) {
               exit $LASTEXITCODE
