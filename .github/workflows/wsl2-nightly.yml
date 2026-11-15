@@ -114,9 +114,22 @@ jobs:
         run: |
           $env:TEMP = $env:CC_SWITCH_WSL_TEST_TEMP
           $env:TMP = $env:CC_SWITCH_WSL_TEST_TEMP
-          & $env:CC_SWITCH_TEST_EXE 'config::tests::' --test-threads=1
+          # libtest filters are substrings: config::tests:: also matches
+          # codex_config::tests::. Select the module prefix, then run exact names.
+          $testList = & $env:CC_SWITCH_TEST_EXE 'config::tests::' --list
           if ($LASTEXITCODE -ne 0) {
             exit $LASTEXITCODE
+          }
+          $configTests = @($testList | Where-Object { $_ -match '^config::tests::.+: test$' } |
+            ForEach-Object { $_ -replace ': test$', '' })
+          if ($configTests.Count -eq 0) {
+            throw 'No config::tests:: tests were discovered'
+          }
+          foreach ($testName in $configTests) {
+            & $env:CC_SWITCH_TEST_EXE $testName --exact --test-threads=1
+            if ($LASTEXITCODE -ne 0) {
+              exit $LASTEXITCODE
+            }
           }
 
       - name: Run full test suite with native Windows storage
