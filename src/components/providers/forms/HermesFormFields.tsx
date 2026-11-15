@@ -146,14 +146,9 @@ export function HermesFormFields({
       return;
     }
     setIsFetchingModels(true);
-    fetchModelsForConfig(
-      baseUrl,
-      apiKey,
-      undefined,
-      undefined,
-      undefined,
-      { proxyConfig },
-    )
+    fetchModelsForConfig(baseUrl, apiKey, undefined, undefined, undefined, {
+      proxyConfig,
+    })
       .then((fetched) => {
         setFetchedModels(fetched);
         if (fetched.length === 0) {

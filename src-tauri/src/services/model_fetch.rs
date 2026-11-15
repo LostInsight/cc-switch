@@ -54,19 +54,32 @@ const KNOWN_COMPAT_SUFFIXES: &[&str] = &[
     "/claude",
 ];
 
+/// 模型列表请求的可选连接、协议与请求头设置。
+pub struct ModelFetchOptions<'a> {
+    pub is_full_url: bool,
+    pub models_url_override: Option<&'a str>,
+    pub user_agent: Option<HeaderValue>,
+    pub proxy_config: Option<&'a ProviderProxyConfig>,
+    pub api_format: Option<&'a str>,
+    pub request_headers: Option<&'a BTreeMap<String, String>>,
+}
+
 /// 获取供应商的可用模型列表
 ///
 /// 使用 OpenAI 兼容的 GET /v1/models 端点，按候选列表顺序尝试。
 pub async fn fetch_models(
     base_url: &str,
     api_key: &str,
-    is_full_url: bool,
-    models_url_override: Option<&str>,
-    user_agent: Option<HeaderValue>,
-    proxy_config: Option<&ProviderProxyConfig>,
-    api_format: Option<&str>,
-    request_headers: Option<&BTreeMap<String, String>>,
+    options: ModelFetchOptions<'_>,
 ) -> Result<Vec<FetchedModel>, String> {
+    let ModelFetchOptions {
+        is_full_url,
+        models_url_override,
+        user_agent,
+        proxy_config,
+        api_format,
+        request_headers,
+    } = options;
     let candidates = build_models_url_candidates(base_url, is_full_url, models_url_override)?;
     let headers =
         build_model_fetch_headers(api_key, api_format, user_agent.as_ref(), request_headers)?;
